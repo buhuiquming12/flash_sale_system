@@ -1,0 +1,13 @@
+# 任务角色。定时任务只需要少量连接。
+#
+# 单实例部署即可；即使部署成多实例也不会重复执行——
+# 关单靠条件更新幂等，活动状态推进靠条件更新幂等。
+# 阶段二引入 Redisson 后再给每个任务套 @DistributedLock，
+# 那时多实例只是浪费一次 Redis 请求。
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 3
+server:
+  port: 8099

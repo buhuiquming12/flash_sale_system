@@ -1,0 +1,13 @@
+# 消费角色（阶段三启用）。
+#
+# consumeThreadNumber 必须与连接池大小对齐：
+#   2 实例 × 12 线程 = 24 并发写 < 30 连接，留 6 个给定时任务和监控查询。
+# 设成 20（2×20=40 > 30）会让消费线程大量阻塞在获取连接上，
+# 表现是消费 TPS 上不去但 CPU 很闲——这个症状很容易被误判成 MQ 慢。
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 30
+      minimum-idle: 10
+server:
+  port: 8090

@@ -1,0 +1,50 @@
+# 集成测试配置。
+#
+# 不激活 web / consumer / job 任何角色 profile：
+#   - web  → 不注册 Controller，测试直接调 Service，少一层无关变量
+#   - job  → 定时任务在测试中途关单会造成间歇性失败
+#
+# 建表复用 sql/V1__init.sql（相对模块目录的上一级），不在测试资源里复制一份 DDL——
+# 复制必然漂移，"测试通过但生产建表少一个索引"是最难查的一类问题。
+spring:
+  sql:
+    init:
+      mode: always
+      schema-locations: file:../sql/V1__init.sql
+      continue-on-error: false
+  datasource:
+    hikari:
+      # 并发测试会同时打满连接；给足以免测试卡在获取连接上，
+      # 那样测出来的"并发数"其实是连接池大小
+      maximum-pool-size: 64
+      minimum-idle: 8
+      connection-timeout: 20000
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+
+logging:
+  level:
+    root: WARN
+    com.fss: INFO
+    org.testcontainers: INFO
+    com.github.dockerjava: WARN
+
+fss:
+  order:
+    pay-timeout: 15m
+    close-scan-delay: 0s        # 测试里立即可扫
+  jwt:
+    secret: fss-integration-test-secret-at-least-32-bytes-long
+  pay:
+    notify-secret: fss-integration-test-pay-secret
+  sentinel:
+    # 必须关掉。并发用例会在几秒内打上万次 submit，撞上 QPS 阈值后
+    # 失败原因变成 RATE_LIMITED，"是否超卖"的断言就被污染成"限流是否生效"了。
+    # 限流本身有专门的用例验证，不该混在正确性用例里
+    enabled: false
+  ratelimit:
+    # 集成测试直接调 Service，不经过 Web 层，拦截器本来就不生效；
+    # 显式关掉是为了让"为什么并发用例没被限流"这件事在配置里就能看明白
+    enabled: false

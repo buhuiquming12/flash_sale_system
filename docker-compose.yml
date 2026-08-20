@@ -1,0 +1,99 @@
+# =====================================================================
+# 阶段一：只需要 MySQL。
+# 阶段二加 redis，阶段三加 rocketmq，阶段四加 prometheus/grafana/loki，
+# 届时在本文件追加，不另起文件——一份拓扑比三份好维护。
+# =====================================================================
+name: fss
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: fss-mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      # 必须与应用时区一致。容器默认 UTC，而应用用 Asia/Shanghai 写入
+      # LocalDateTime，两者并存会让 NOW(3) 与列 DEFAULT 生成的时间比 Java
+      # 写入的时间慢 8 小时——表现是订单创建时间、支付时间对不上，
+      # 而 cancel_time 与 expire_time 的比较也会得出错误结论。
+      - --default-time-zone=+08:00
+      - --max-connections=500
+      - --innodb-buffer-pool-size=1G
+      - --slow-query-log=1
+      - --long-query-time=0.5
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: flash_sale
+    volumes:
+      # 容器首次启动时按文件名顺序执行 /docker-entrypoint-initdb.d 下的脚本。
+      # 注意：只在数据卷为空时执行，改了 DDL 要 docker compose down -v 才会重跑。
+      - ./sql:/docker-entrypoint-initdb.d:ro
+      - mysql-data:/var/lib/mysql
+    ports:
+      - "3307:3306"        # 宿主 3306 常被本机 MySQL 占用，映射到 3307
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---- 以下服务在对应阶段启用，用 profiles 控制，默认不启动 ----
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: fss-redis
+    profiles: ["phase2"]
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 1gb
+      # 秒杀库存和用户购买标记绝不能被淘汰。用 allkeys-lru 时内存压力下
+      # Redis 可能淘汰 seckill:stock，后续请求读到 0 直接导致业务错乱。
+      # 宁可写入失败（noeviction 下写满会报错，能被监控发现），也不能静默丢数据。
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+
+  rocketmq-namesrv:
+    image: apache/rocketmq:5.2.0
+    container_name: fss-rmq-namesrv
+    profiles: ["phase3"]
+    command: sh mqnamesrv
+    ports:
+      - "9876:9876"
+
+  rocketmq-broker:
+    image: apache/rocketmq:5.2.0
+    container_name: fss-rmq-broker
+    profiles: ["phase3"]
+    command: sh mqbroker -c /home/rocketmq/conf/broker.conf
+    depends_on:
+      - rocketmq-namesrv
+    volumes:
+      - ./docker/rocketmq/broker.conf:/home/rocketmq/conf/broker.conf:ro
+    ports:
+      - "10909:10909"
+      - "10911:10911"
+
+  # 四级限流的第一级。只在多实例部署形态下才有意义（它要 proxy_pass 到
+  # fss-web-1 / fss-web-2 两个容器），本地开发时应用跑在宿主机上，
+  # 所以放在 phase5 profile 里默认不启动。配置本身见 docker/nginx/nginx.conf
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: fss-nginx
+    profiles: ["phase5"]
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+
+volumes:
+  mysql-data:
+  redis-data:

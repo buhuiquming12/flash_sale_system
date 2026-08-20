@@ -1,0 +1,8 @@
+# Web 角色：只处理 HTTP 请求，不跑消费与定时任务。
+# 阶段一秒杀是同步落库，DB 压力全在这里，连接池保持 30；
+# 阶段三异步化后 Web 层只写本地消息表，可降到 10。
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 30
+      minimum-idle: 10

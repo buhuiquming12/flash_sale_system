@@ -1,0 +1,151 @@
+server:
+  port: 8080
+  tomcat:
+    threads:
+      max: 400
+      min-spare: 50
+    accept-count: 1000
+    max-connections: 10000
+  shutdown: graceful
+
+spring:
+  application:
+    name: fss
+  profiles:
+    # 默认本地开发：web + job 一把起，dev 打开模拟支付辅助接口
+    default: web,job,dev
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+    default-property-inclusion: non_null
+  datasource:
+    url: jdbc:mysql://localhost:3306/flash_sale?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true&useSSL=false
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    type: com.zaxxer.hikari.HikariDataSource
+    hikari:
+      maximum-pool-size: 30
+      minimum-idle: 10
+      # 快速失败，不让请求堆在获取连接上——堆积会让线程池耗尽，
+      # 表现为整个应用无响应而不是单个接口变慢
+      connection-timeout: 3000
+      max-lifetime: 1740000
+      pool-name: fss-hikari
+  data:
+    redis:
+      host: ${FSS_REDIS_HOST:127.0.0.1}
+      port: ${FSS_REDIS_PORT:6379}
+      database: 0
+      # 秒杀链路上的 Redis 调用必须快速失败。超时给得长（比如 5s）时，
+      # Redis 一慢，Tomcat 线程全部堆在等 Redis 上，表现是整个应用无响应，
+      # 而不是"秒杀接口变慢"——故障范围被放大了
+      timeout: 1000ms
+      connect-timeout: 1000ms
+      lettuce:
+        pool:
+          # Lettuce 是单连接多路复用，池子主要给阻塞型命令和事务用，不必很大
+          max-active: 64
+          max-idle: 16
+          min-idle: 8
+          max-wait: 1000ms
+        shutdown-timeout: 200ms
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    default-enum-type-handler: com.baomidou.mybatisplus.core.handlers.MybatisEnumTypeHandler
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+      # 逻辑删除未启用：订单、库存流水都必须物理保留，做审计与对账的依据
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [%X{traceId}] %logger{36} - %msg%n"
+  level:
+    root: INFO
+    com.fss: INFO
+
+# ---------------------------------------------------------------------
+# 业务配置。全部绑定到 FssProperties，不散落在代码里——
+# 超时时长、限流阈值需要在压测中反复调整，硬编码意味着每次都要重新编译。
+# ---------------------------------------------------------------------
+fss:
+  order:
+    pay-timeout: 15m            # 决策 3：关单时长，不受 MQ 延迟级别约束
+    close-scan-delay: 2m        # 扫描比过期时刻晚这么久才处理
+    close-scan-batch: 200
+  seckill:
+    result-ttl: 30m
+    token-ttl: 5m
+    warmup-ahead: 5m
+    cache-ttl: 2h
+    cache-ttl-jitter: 10m
+    null-cache-ttl: 60s
+    cache-physical-buffer: 30m    # 物理 TTL 相对逻辑过期的缓冲，保证旧值可读
+    key-ttl-after-end: 1h         # 活动结束后 Redis key 再留多久（供轮询与对账）
+    released-ttl: 25h             # 已回补订单号 Set 的 TTL，必须覆盖活动结束后的关单
+    allow-repurchase-after-cancel: false   # 决策 1，启动时断言必须为 false
+  ratelimit:
+    enabled: true
+    user-qps: 2
+    ip-qps: 20
+    activity-qps: 5000
+    global-qps: 12000
+    result-qps: 5
+    burst-factor: 2               # 桶容量 = qps × 该倍数，容纳正常的双击与刷新
+  sentinel:
+    enabled: true
+    submit-qps: 6000              # 单实例阈值，3 个 web 实例总量是它的 3 倍
+    result-qps: 8000
+    activity-detail-qps: 3000
+    lua-concurrency: 200          # 用并发线程数而非 QPS，见 SentinelConfig 注释
+    slow-rt-ms: 200
+    circuit-break-seconds: 10
+  mq:
+    topic:
+      order-create: FSS_ORDER_CREATE
+      order-close: FSS_ORDER_CLOSE
+      stock-release: FSS_STOCK_RELEASE
+      stock-rollback: FSS_STOCK_ROLLBACK
+    group:
+      order-create: GID_FSS_ORDER_CREATE
+      order-close: GID_FSS_ORDER_CLOSE
+      stock-release: GID_FSS_STOCK_RELEASE
+      stock-rollback: GID_FSS_STOCK_ROLLBACK
+    send-timeout: 2000
+    max-resend: 5
+  degrade:
+    seckill-enabled: true
+    backlog-threshold: 50000
+  jwt:
+    # 生产必须由环境变量 FSS_JWT_SECRET 注入
+    secret: ${FSS_JWT_SECRET:fss-local-dev-only-secret-change-me-in-prod}
+    ttl: 2h
+    issuer: fss
+  pay:
+    notify-secret: ${FSS_PAY_SECRET:fss-mock-pay-secret-change-me}
+    notify-tolerance: 5m
+  job:
+    close-expired-cron: "0 */2 * * * ?"
+    activity-state-cron: "0 * * * * ?"
+    warmup-cron: "0 * * * * ?"

@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>秒杀演示</title>
+<style>
+  :root { --line:#e3e6eb; --muted:#6b7280; --primary:#d9363e; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+         background:#f5f6f8; color:#1f2328; }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:12px 20px;
+           display:flex; align-items:center; gap:12px; position:sticky; top:0; z-index:9; }
+  header h1 { font-size:16px; margin:0; }
+  main { max-width:920px; margin:20px auto; padding:0 16px; }
+  section { background:#fff; border:1px solid var(--line); border-radius:8px;
+            padding:16px; margin-bottom:16px; }
+  h2 { font-size:14px; margin:0 0 12px; color:var(--muted); font-weight:600; }
+  input, button, select { font:inherit; padding:6px 10px; border:1px solid var(--line);
+                          border-radius:6px; background:#fff; }
+  button { cursor:pointer; }
+  button.primary { background:var(--primary); color:#fff; border-color:var(--primary); font-weight:600; }
+  button.primary:disabled { background:#c9ccd1; border-color:#c9ccd1; cursor:not-allowed; }
+  button.ghost { background:#fff; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .card { border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:10px; }
+  .price { color:var(--primary); font-size:20px; font-weight:700; }
+  .origin { color:var(--muted); text-decoration:line-through; margin-left:6px; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px;
+         background:#eef2f7; color:var(--muted); }
+  .tag.on { background:#fdeaea; color:var(--primary); }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px; border-bottom:1px solid var(--line); font-size:13px; }
+  th { color:var(--muted); font-weight:600; }
+  #log { font-family:Consolas,monospace; font-size:12px; background:#1f2328; color:#d5d8dd;
+         border-radius:8px; padding:12px; height:180px; overflow:auto; white-space:pre-wrap; }
+  .muted { color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>秒杀系统演示</h1>
+  <span id="who" class="tag">未登录</span>
+  <span class="muted" id="clock"></span>
+</header>
+
+<main>
+  <section>
+    <h2>1 · 登录</h2>
+    <div class="row">
+      <input id="username" placeholder="用户名" value="demo1" size="12">
+      <input id="password" type="password" placeholder="密码" value="Passw0rd1" size="14">
+      <button class="primary" onclick="login()">登录</button>
+      <button onclick="logout()">登出</button>
+      <span class="muted">默认演示账号 demo1 / Passw0rd1，管理员 admin</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>2 · 秒杀活动</h2>
+    <div class="row" style="margin-bottom:12px">
+      <button class="ghost" onclick="loadActivities()">刷新活动列表</button>
+    </div>
+    <div id="activities"><span class="muted">请先登录后刷新</span></div>
+  </section>
+
+  <section>
+    <h2>3 · 我的订单</h2>
+    <div class="row" style="margin-bottom:12px">
+      <button class="ghost" onclick="loadOrders()">刷新订单</button>
+    </div>
+    <table>
+      <thead><tr><th>订单号</th><th>状态</th><th>金额</th><th>剩余支付</th><th>操作</th></tr></thead>
+      <tbody id="orders"><tr><td colspan="5" class="muted">暂无</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>4 · 请求日志</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+const S = { token: null, user: null };
+
+function log(msg, obj) {
+  const el = document.getElementById('log');
+  const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  el.textContent += `[${ts}] ${msg}` + (obj ? ' ' + JSON.stringify(obj) : '') + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+
+async function api(path, { method = 'GET', body } = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (S.token) headers['Authorization'] = 'Bearer ' + S.token;
+  const resp = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const json = await resp.json().catch(() => ({ code: -1, message: 'HTTP ' + resp.status }));
+  // 业务失败也是 200 + 非 0 code，所以只看 code 不看 HTTP 状态
+  if (json.code !== 0) {
+    log(`✗ ${method} ${path} → code=${json.code} ${json.message}`);
+    throw Object.assign(new Error(json.message), { code: json.code });
+  }
+  log(`✓ ${method} ${path}`, json.data);
+  return json.data;
+}
+
+async function login() {
+  const username = document.getElementById('username').value.trim();
+  const password = document.getElementById('password').value;
+  const d = await api('/api/user/login', { method: 'POST', body: { username, password } });
+  S.token = d.token;
+  S.user = d;
+  document.getElementById('who').textContent = `${d.username} (userId=${d.userId})`;
+  document.getElementById('who').className = 'tag on';
+  await loadActivities();
+  await loadOrders();
+}
+
+/**
+ * 登出。
+ * 阶段二起服务端真的会撤销 jti（Redis 白名单里删掉），
+ * 不再是"客户端丢掉 token、服务端仍然认它到过期"。
+ */
+async function logout() {
+  try {
+    await api('/api/user/logout', { method: 'POST' });
+  } catch (e) {
+    // token 已过期时登出会失败，但结果一样：这个会话没了
+  }
+  S.token = null;
+  S.user = null;
+  document.getElementById('who').textContent = '未登录';
+  document.getElementById('who').className = 'tag';
+}
+
+async function loadActivities() {
+  const d = await api('/api/activity/list?page=1&size=10');
+  const box = document.getElementById('activities');
+  if (!d.list.length) { box.innerHTML = '<span class="muted">暂无活动</span>'; return; }
+  const details = await Promise.all(d.list.map(a => api('/api/activity/' + a.activityId)));
+  box.innerHTML = details.map(renderActivity).join('');
+  syncClock(details[0]);
+}
+
+function renderActivity(a) {
+  const goods = a.goodsList.map(g => `
+    <div class="row" style="justify-content:space-between; margin-top:8px">
+      <div>
+        <div>${g.productTitle} <span class="tag">${g.spec}</span></div>
+        <div><span class="price">¥${g.seckillPrice}</span><span class="origin">¥${g.originPrice}</span></div>
+        <div class="muted">剩余 ${g.remainStock} / ${g.totalStock}，每人限 ${g.limitPerUser} 件</div>
+      </div>
+      <button class="primary" ${g.soldOut || a.status !== 2 ? 'disabled' : ''}
+              onclick="seckill(${a.activityId}, ${g.skuId}, this)">
+        ${g.soldOut ? '已售罄' : a.status === 1 ? '未开始' : a.status === 2 ? '立即秒杀' : '已结束'}
+      </button>
+    </div>`).join('');
+  return `<div class="card">
+      <div class="row" style="justify-content:space-between">
+        <strong>${a.name}</strong>
+        <span class="tag ${a.status === 2 ? 'on' : ''}">${a.statusDesc}</span>
+      </div>
+      <div class="muted">${a.startTime} ~ ${a.endTime}</div>
+      ${goods}
+    </div>`;
+}
+
+async function seckill(activityId, skuId, btn) {
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = '抢购中…';
+  try {
+    // 阶段二：先领令牌，再往令牌决定的动态路径提交。
+    // 令牌是一次性的（服务端 GETDEL 消费），拿不到就抢不了 ——
+    // 这只是抬高脚本门槛，真正的防线是限流和一人一单
+    const t = await api(`/api/seckill/token?activityId=${activityId}&skuId=${skuId}`,
+                        { method: 'POST' });
+    // quantity 固定 1；不传 userId —— 服务端只认 JWT，带了会被 @Null 直接拒绝
+    const d = await api(t.path, {
+      method: 'POST', body: { activityId, skuId, quantity: 1 }
+    });
+    if (d.status === 1) {
+      alert('秒杀成功！订单号 ' + d.orderNo + '\n请在 15 分钟内完成支付');
+    } else {
+      // 阶段三异步化后走这条分支：轮询 /api/seckill/result
+      await poll(d.requestNo, activityId, skuId, d.pollAfterMs || 300);
+    }
+  } catch (e) {
+    alert(errText(e));
+  } finally {
+    btn.textContent = original;
+    await loadActivities();
+    await loadOrders();
+  }
+}
+
+/** 退避轮询：300/500/800/1300/2000ms 后固定 2000ms，累计 20s 放弃 */
+async function poll(requestNo, activityId, skuId, firstDelay) {
+  const delays = [firstDelay, 500, 800, 1300, 2000];
+  let elapsed = 0, i = 0;
+  while (elapsed < 20000) {
+    const wait = delays[i] ?? 2000;
+    await new Promise(r => setTimeout(r, wait));
+    elapsed += wait; i++;
+    // 必须带上 activityId/skuId：结果 key 含 {activityId:skuId} hash tag，
+    // 不带就只能回查数据库，命不中 Redis
+    const r = await api('/api/seckill/result?requestNo=' + encodeURIComponent(requestNo)
+                        + '&activityId=' + activityId + '&skuId=' + skuId);
+    if (r.status === 0) continue;
+    if (r.status === 1) { alert('秒杀成功！订单号 ' + r.orderNo); return; }
+    alert('秒杀失败：' + (r.failReason || r.statusDesc)); return;
+  }
+  alert('结果查询超时，请到订单列表确认');
+}
+
+async function loadOrders() {
+  const d = await api('/api/order/list?page=1&size=10');
+  const tb = document.getElementById('orders');
+  if (!d.list.length) { tb.innerHTML = '<tr><td colspan="5" class="muted">暂无订单</td></tr>'; return; }
+  tb.innerHTML = d.list.map(o => `
+    <tr>
+      <td>${o.orderNo}</td>
+      <td><span class="tag ${o.status === 0 ? 'on' : ''}">${o.statusDesc}</span></td>
+      <td>¥${o.payAmount}</td>
+      <td>${o.remainSeconds != null ? o.remainSeconds + 's' : '-'}</td>
+      <td>
+        ${o.status === 0 ? `<button class="primary" onclick="pay('${o.orderNo}')">支付</button>
+                            <button class="ghost" onclick="cancel('${o.orderNo}')">取消</button>` : '-'}
+      </td>
+    </tr>`).join('');
+}
+
+async function pay(orderNo) {
+  const p = await api('/api/pay/create', { method: 'POST', body: { orderNo } });
+  // 真实渠道会由渠道服务器回调；演示环境用 dev-only 接口换一份合法签名再自投
+  const signed = await api(`/api/pay/mock-sign?payNo=${p.payNo}&amount=${p.amount}&status=SUCCESS`);
+  await api('/api/pay/notify', { method: 'POST', body: {
+    payNo: signed.payNo, outTradeNo: signed.outTradeNo, amount: Number(signed.amount),
+    status: signed.status, timestamp: Number(signed.timestamp), sign: signed.sign } });
+  alert('支付成功');
+  await loadOrders();
+  await loadActivities();
+}
+
+async function cancel(orderNo) {
+  if (!confirm('取消后库存会释放给其他用户，且本次活动你将无法再次参与。确认取消？')) return;
+  try {
+    const d = await api(`/api/order/${orderNo}/cancel`, { method: 'POST' });
+    alert(d.notice);
+  } catch (e) { alert(errText(e)); }
+  await loadOrders();
+  await loadActivities();
+}
+
+function errText(e) {
+  const map = {
+    3001: '库存不足，下次早点来',
+    3002: '你已参与过本次秒杀',
+    2002: '活动还没开始',
+    2003: '活动已结束',
+    1004: '请求过于频繁，请稍后再试',
+    1002: '请先登录',
+  };
+  return map[e.code] || e.message || '请求失败';
+}
+
+/** 用服务端时间校准本地时钟，避免本地快几十秒时疯狂提交被全部拒绝 */
+function syncClock(activity) {
+  if (!activity || !activity.serverTime) return;
+  const server = new Date(activity.serverTime.replace(' ', 'T'));
+  const skew = server.getTime() - Date.now();
+  const el = document.getElementById('clock');
+  el.textContent = `服务端时间 ${activity.serverTime}` +
+      (Math.abs(skew) > 3000 ? `（本地时钟偏差 ${Math.round(skew / 1000)}s）` : '');
+}
+</script>
+</body>
+</html>

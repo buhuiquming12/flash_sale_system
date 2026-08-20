@@ -1,0 +1,9 @@
+logging:
+  level:
+    com.fss: DEBUG
+    com.fss.domain.mapper: DEBUG
+
+# 本地开发把定时任务调稀一点，避免刷屏
+fss:
+  job:
+    close-expired-cron: "0 */5 * * * ?"
