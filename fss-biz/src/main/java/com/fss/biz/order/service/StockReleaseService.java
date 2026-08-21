@@ -1,16 +1,18 @@
 package com.fss.biz.order.service;
 
-import com.fss.biz.seckill.core.SeckillExecutor;
+import com.fss.biz.mq.ReliableMqProducer;
 import com.fss.common.enums.StockChangeType;
 import com.fss.common.error.Assert;
 import com.fss.common.error.ErrorCode;
+import com.fss.common.trace.TraceContext;
 import com.fss.domain.entity.Order;
 import com.fss.domain.entity.SeckillGoods;
 import com.fss.domain.entity.StockLog;
 import com.fss.domain.mapper.OrderMapper;
 import com.fss.domain.mapper.SeckillGoodsMapper;
 import com.fss.domain.mapper.StockLogMapper;
-import com.fss.infra.tx.TxSupport;
+import com.fss.domain.message.StockReleaseMessage;
+import com.fss.infra.mq.MqTopics;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DuplicateKeyException;
@@ -46,7 +48,7 @@ public class StockReleaseService {
     private final OrderMapper        orderMapper;
     private final SeckillGoodsMapper goodsMapper;
     private final StockLogMapper     stockLogMapper;
-    private final SeckillExecutor    executor;
+    private final ReliableMqProducer producer;
 
     /**
      * 释放某订单占用的库存。
@@ -93,7 +95,7 @@ public class StockReleaseService {
                     "库存回补失败，locked_stock 不足: orderNo=" + orderNo);
         }
 
-        releaseRedisAfterCommit(order);
+        releaseRedisAfterCommit(order, reason);
 
         log.info("stage=STOCK_RELEASE orderNo={} qty={} idempotent=false reason={}",
                 orderNo, order.getQuantity(), reason);
@@ -101,19 +103,37 @@ public class StockReleaseService {
     }
 
     /**
-     * Redis 库存回补必须在<b>事务提交之后</b>。
+     * Redis 库存回补：登记一条 {@code FSS_STOCK_RELEASE}，事务提交后投递。
      *
-     * <p>顺序反了（事务内先 INCRBY Redis）会有一段时间：Redis 库存已经加回、
-     * 别人已经能抢到这一份，而 DB 事务还没提交甚至可能回滚——回滚之后
-     * 订单还是待支付、DB 库存没还，但 Redis 已经多放出去一个资格，就是超卖。
+     * <h3>为什么 DB 那半留在事务里、Redis 这半走消息</h3>
+     * 这里与设计文档（docs/05）有一处刻意偏差。文档把整个取消回补都改成消息，
+     * 实现只把 Redis 那半挪了出来。两半的性质完全不同：
+     * <ul>
+     *   <li>DB 回补<b>能</b>和关单同事务，所以必须同事务。同一个库、两条 UPDATE，
+     *       原子性是免费的。拆成消息反而引入新的失败模式：消费端永久失败时，
+     *       订单已是 CANCELLED 却永远拿不回库存，而"已取消"没法回滚成"待支付"。</li>
+     *   <li>Redis 回补<b>没法</b>加入 DB 事务，所以必须可重试。阶段二是提交后直接
+     *       INCRBY，失败只打日志等对账——那期间 Redis 少一份库存，是实打实的少卖。
+     *       登记成消息之后它有了 5 次退避重试与死信兜底。</li>
+     * </ul>
      *
-     * <p>放在提交后的代价是：提交成功而 Redis 回补失败时，Redis 少一份库存（少卖）。
-     * 这个方向是安全的，而且脚本 C 的 {@code released} Set 让重试天然幂等，
-     * 阶段四的库存对账会把它收敛回来。
+     * <p>顺序仍然是"提交之后"才投递。反了（事务内先投递、消费端抢先 INCRBY）会有
+     * 一段时间：Redis 库存已经加回、别人已经能抢到这一份，而 DB 事务还没提交甚至
+     * 可能回滚——回滚之后订单还是待支付、DB 库存没还，Redis 却多放出去一个资格，
+     * 就是超卖。{@code registerAfterCommit} 把消息行写在同一事务里、send 放在提交后，
+     * 两个方向都占住了。
      */
-    private void releaseRedisAfterCommit(Order order) {
-        TxSupport.afterCommit("releaseRedisStock:" + order.getOrderNo(),
-                () -> executor.release(order.getActivityId(), order.getSkuId(),
-                        order.getOrderNo(), order.getQuantity()));
+    private void releaseRedisAfterCommit(Order order, String reason) {
+        producer.registerAfterCommit(MqTopics.STOCK_RELEASE, order.getOrderNo(),
+                StockReleaseMessage.builder()
+                        .orderNo(order.getOrderNo())
+                        .activityId(order.getActivityId())
+                        .skuId(order.getSkuId())
+                        .quantity(order.getQuantity())
+                        .reason(reason)
+                        .traceId(TraceContext.get())
+                        .version(StockReleaseMessage.CURRENT_VERSION)
+                        .build(),
+                null);
     }
 }

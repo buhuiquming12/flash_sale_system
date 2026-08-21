@@ -11,7 +11,7 @@
 
     <artifactId>fss-infra</artifactId>
     <name>fss-infra</name>
-    <description>MyBatis-Plus / Redis / Redisson / Sentinel 配置、Lua 脚本、分布式锁、缓存与限流原语。RocketMQ 于阶段三接入。</description>
+    <description>MyBatis-Plus / Redis / Redisson / Sentinel / RocketMQ 配置、Lua 脚本、分布式锁、缓存与限流原语。</description>
 
     <dependencies>
         <dependency>
@@ -41,6 +41,10 @@
         <dependency>
             <groupId>com.alibaba.csp</groupId>
             <artifactId>sentinel-annotation-aspectj</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.rocketmq</groupId>
+            <artifactId>rocketmq-spring-boot-starter</artifactId>
         </dependency>
         <dependency>
             <groupId>com.baomidou</groupId>

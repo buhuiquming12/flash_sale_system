@@ -116,7 +116,8 @@ class TokenAndJwtTest extends IntegrationTestBase {
 
         SeckillCmd good = SeckillCmd.of(act.activityId(), act.skuId(), 1);
         good.setToken(tokenService.issue(userId, act.activityId(), act.skuId()));
-        assertThat(seckillService.submit(good, userId).getOrderNo()).isNotBlank();
+        // 令牌校验通过之后走的是完整的异步链路，所以要等消费端把订单建出来
+        assertThat(fixture.submitAndAwaitWithToken(good, userId).getOrderNo()).isNotBlank();
         assertThat(fixture.redisStock(act.activityId(), act.skuId())).isEqualTo(9L);
     }
 

@@ -119,6 +119,16 @@ public class FssProperties {
         /** 总开关，可运行时关闭秒杀入口 */
         private boolean seckillEnabled   = true;
         private long    backlogThreshold = 50_000;
+        /**
+         * 下发给客户端的轮询间隔（毫秒）。
+         *
+         * <p>这是一个<b>软限流手段</b>：异步化之后每个用户提交完都要轮询结果，
+         * 1 万个用户按 300ms 轮询就是 33000 QPS 打在结果接口上，
+         * 比秒杀提交本身还高。服务端下发间隔，客户端照着等，
+         * 比在客户端硬编码好——降级时（docs/07 Level 2）可以直接拉长到 2000ms，
+         * 不用发版。
+         */
+        private int     pollIntervalMs   = 300;
     }
 
     @Data
@@ -149,6 +159,14 @@ public class FssProperties {
         private String closeExpiredCron = "0 */2 * * * ?";
         private String activityStateCron = "0 * * * * ?";
         private String warmupCron        = "0 * * * * ?";
+        /**
+         * 消息重发任务的间隔（毫秒）。
+         *
+         * <p>用 {@code fixedDelay} 而不是 cron：重发的语义是"上一轮处理完之后再等
+         * 这么久"，用 cron 的话 MQ 长时间不可用时，一轮跑 30 秒而 cron 每 30 秒触发，
+         * 两轮会重叠——虽然分布式锁挡得住，但那是靠锁掩盖了配置问题。
+         */
+        private long   mqResendDelayMs   = 30_000;
     }
 
     /**

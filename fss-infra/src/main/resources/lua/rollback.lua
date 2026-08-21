@@ -13,6 +13,7 @@
 -- ARGV[3] reason
 -- ARGV[4] keepBought：1 = 保留用户购买标记，0 = 归还
 -- ARGV[5] 请求结果 TTL（秒）
+-- ARGV[6] 写入的失败状态：2=库存不足 3=已参与过 5=系统繁忙已退回
 --
 -- 返回 0 = 已回补   1 = 状态不允许回补（幂等命中，未做任何修改）
 -- =====================================================================
@@ -27,10 +28,11 @@ local qty        = tonumber(ARGV[2])
 local reason     = ARGV[3]
 local keepBought = tonumber(ARGV[4]) == 1
 local reqTtl     = tonumber(ARGV[5])
+local failStatus = tonumber(ARGV[6])
 
 -- 幂等靠请求状态机而不是计数器：
--- 只有「排队中(0)」的请求可以回补。已成功(1)不能回补，已补偿(5)不能重复回补，
--- 失败态(2/3)本就没扣过库存。无论回补消息重复投递多少次，INCRBY 只执行一次
+-- 只有「排队中(0)」的请求可以回补。已成功(1)不能回补，已是任何终态都不能重复回补。
+-- 无论回补消息重复投递多少次，INCRBY 只执行一次
 if redis.call('EXISTS', reqKey) == 0 then
     return 1
 end
@@ -39,8 +41,14 @@ if tonumber(redis.call('HGET', reqKey, 'status') or '-1') ~= 0 then
 end
 
 -- 先改状态，把自己变成唯一执行者。Lua 的原子性保证中间不存在
--- 「status 仍是 0 但库存已经加回」这种能被其他脚本观察到的状态
-redis.call('HSET', reqKey, 'status', 5, 'reason', reason)
+-- 「status 仍是 0 但库存已经加回」这种能被其他脚本观察到的状态。
+--
+-- 写入的是<b>真实失败原因</b>而不是固定的 5。设计文档一律写 5（已补偿），
+-- 而消费端同时会往 t_seckill_request 落一条 status=3（已参与过）——
+-- 同一个请求在 Redis 和 DB 里有两个不同的结论，查询接口返回哪个取决于
+-- Redis 的 30 分钟 TTL 有没有到，这是实打实的不一致。
+-- 确定性失败写具体码（2/3），只有系统原因的回补才写 5
+redis.call('HSET', reqKey, 'status', failStatus, 'reason', reason)
 redis.call('EXPIRE', reqKey, reqTtl)
 
 redis.call('INCRBY', stockKey, qty)

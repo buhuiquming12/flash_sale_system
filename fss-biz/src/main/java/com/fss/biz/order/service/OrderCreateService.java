@@ -1,6 +1,7 @@
 package com.fss.biz.order.service;
 
 import com.fss.biz.audit.AdminAuditService;
+import com.fss.biz.mq.ReliableMqProducer;
 import com.fss.biz.product.service.ProductService;
 import com.fss.common.enums.ActivityStatus;
 import com.fss.common.enums.OrderStatus;
@@ -22,8 +23,10 @@ import com.fss.domain.mapper.SeckillActivityMapper;
 import com.fss.domain.mapper.SeckillGoodsMapper;
 import com.fss.domain.mapper.SeckillRequestMapper;
 import com.fss.domain.mapper.StockLogMapper;
+import com.fss.domain.message.OrderCloseMessage;
 import com.fss.domain.message.OrderCreateMessage;
 import com.fss.infra.config.FssProperties;
+import com.fss.infra.mq.MqTopics;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DuplicateKeyException;
@@ -61,6 +64,7 @@ public class OrderCreateService {
     private final SeckillRequestMapper  requestMapper;
     private final StockLogMapper        stockLogMapper;
     private final ProductService        productService;
+    private final ReliableMqProducer    producer;
     private final FssProperties         props;
 
     /**
@@ -146,10 +150,36 @@ public class OrderCreateService {
         // ---- 请求记录落库，供对账与长期审计 ----
         upsertRequest(msg, order.getOrderNo());
 
+        // ---- 登记关单定时消息。与订单同事务，提交后才真正投递 ----
+        registerCloseMessage(order, msg.getTraceId());
+
         log.info("stage=ORDER_CREATE requestNo={} orderNo={} userId={} amount={} result=OK cost={}ms",
                 msg.getRequestNo(), order.getOrderNo(), msg.getUserId(), payAmount,
                 System.currentTimeMillis() - t0);
         return new Created(order, goods.getAvailableStock() - msg.getQuantity(), false);
+    }
+
+    /**
+     * 登记关单定时消息（决策 3）。
+     *
+     * <p><b>为什么放在落库事务里</b>：消息行与订单行同一个事务，所以"订单已创建"和
+     * "关单消息已登记"不可能只发生一半。少了这个原子性，一次事务回滚就能造出
+     * 一张永远不会被关闭的订单——它会一直占着库存，直到有人手工发现。
+     * 定时扫描能兜住，但那是 2 分钟一轮的兜底，不该是主路径。
+     *
+     * <p>投递时刻取 {@code expire_time} 而不是"现在 + 15 分钟"：
+     * 两者在这一刻是同一个值，但 {@code expire_time} 是写进 DB 的那个值，
+     * 消费端也会读它。用同一个来源可以避免"消息在 14:59 触发而 DB 说 15:01 才过期"。
+     */
+    private void registerCloseMessage(Order order, String traceId) {
+        producer.registerAfterCommit(MqTopics.ORDER_CLOSE, order.getOrderNo(),
+                OrderCloseMessage.builder()
+                        .orderNo(order.getOrderNo())
+                        .userId(order.getUserId())
+                        .traceId(traceId)
+                        .version(OrderCloseMessage.CURRENT_VERSION)
+                        .build(),
+                order.getExpireTime());
     }
 
     /**

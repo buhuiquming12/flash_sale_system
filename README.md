@@ -10,6 +10,9 @@
         → MySQL 最终兜底 → 延迟关闭订单 → 对账补偿
 ```
 
+阶段三起主链路已经是这个形状：秒杀接口只做「Lua 判扣 + 投一条消息」就返回排队中，
+订单由消费端创建，关单由任意时刻定时消息触发。剩下的「对账补偿」是阶段四。
+
 ## 技术栈
 
 | 层次 | 选型 |
@@ -18,7 +21,7 @@
 | 应用框架 | Spring Boot 3.3.x |
 | 持久层 | MyBatis-Plus 3.5.x + MySQL 8.0 |
 | 缓存 | Redis 7.2 + Lettuce（Lua 与读写）+ Redisson（分布式锁） |
-| 消息队列 | Apache RocketMQ 5.2.x |
+| 消息队列 | Apache RocketMQ 5.3.0 + rocketmq-spring-boot-starter 2.3.1 |
 | 限流熔断 | Nginx `limit_req` + Sentinel 1.8.x + Redis Lua 令牌桶 |
 | 认证 | Spring Security 6 + JWT |
 | 可观测 | Micrometer + Prometheus + Grafana + Loki |
@@ -50,15 +53,19 @@
 需要 JDK 17、Maven 3.9+、Docker。
 
 ```bash
-# 1. 起 MySQL 与 Redis（MySQL 首次启动会自动执行 sql/V1__init.sql 建表）
-docker compose --profile phase2 up -d mysql redis
+# 1. 起 MySQL、Redis、RocketMQ（MySQL 首次启动会自动执行 sql/V1__init.sql 建表）
+docker compose --profile phase2 --profile phase3 up -d
 
-# 2. 打包
+# 2. 建 Topic（autoCreateTopicEnable=false，必须显式创建；只需在 broker 首次起来后做一次）
+docker cp docker/rocketmq/init-topics.sh fss-rmq-broker:/home/rocketmq/init-topics.sh
+docker exec fss-rmq-broker sh /home/rocketmq/init-topics.sh
+
+# 3. 打包
 mvn clean package -DskipTests
 
-# 3. 启动（web + job 单进程，dev profile 会初始化演示数据）
+# 4. 启动（web + consumer + job 单进程，dev profile 会初始化演示数据）
 java -jar fss-app/target/fss-app.jar \
-  --spring.profiles.active=web,job,dev \
+  --spring.profiles.active=web,consumer,job,dev \
   --server.port=8080 \
   --spring.datasource.url='jdbc:mysql://127.0.0.1:3307/flash_sale?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false'
 ```
@@ -68,29 +75,39 @@ java -jar fss-app/target/fss-app.jar \
 - 演示账号：`admin` / `demo1` / `demo2` / `demo3`，密码统一 `Passw0rd1`
 - 启动后自动创建一个「1 分钟后开抢、库存 100、每人限 1 件」的活动并完成 Redis 预热
 
-注意 `server.port` 必须显式指定：`application-job.yml` 里设了 8099，
-profile 顺序 `web,job` 时后者会覆盖前者。
+**`consumer` profile 必须激活**：阶段三起订单由消费端创建，不激活它所有秒杀都会
+永远停在"排队中"。
 
-Redis 地址默认 `127.0.0.1:6379`，可用 `FSS_REDIS_HOST` / `FSS_REDIS_PORT` 覆盖。
+注意 `server.port` 必须显式指定：`application-job.yml` 里设了 8099、
+`application-consumer.yml` 设了 8090，profile 顺序靠后的会覆盖前面的。
+
+Redis 地址默认 `127.0.0.1:6379`，可用 `FSS_REDIS_HOST` / `FSS_REDIS_PORT` 覆盖；
+RocketMQ 默认 `127.0.0.1:9876`，可用 `FSS_MQ_NAMESRV` 覆盖。
 **Redis 必须可用**：库存判定是 fail-closed 的，连不上时秒杀接口一律返回
 「系统繁忙」而不是放行——放行就是超卖。
 
 ## 运行测试
 
-集成测试用 Testcontainers 起真实 MySQL 与真实 Redis（不是 H2、不是嵌入式 Redis），
-需要 Docker 在运行：
+集成测试用 Testcontainers 起真实 MySQL、真实 Redis、真实 RocketMQ
+（不是 H2、不是嵌入式 Redis、不是 Mock 的 `RocketMQTemplate`），需要 Docker 在运行：
 
 ```bash
-docker pull mysql:8.0        # 首次
-docker pull redis:7.2-alpine # 首次
+docker pull mysql:8.0          # 首次
+docker pull redis:7.2-alpine   # 首次
+docker pull apache/rocketmq:5.3.0
 mvn clean verify
 ```
+
+测试用的 MQ 端口刻意错开 compose 的那套（namesrv 9877、broker 10921），
+所以 `mvn verify` 和联调环境可以同时活着。
 
 | 测试类 | 覆盖 |
 | --- | --- |
 | `OrderStateMachineTest` | 穷举 6×6 状态迁移：7 条合法、29 条拒绝 |
 | `SeckillConcurrencyTest` | C1 库存100×500并发、C2 单用户50并发、C3 库存1×200并发、C4/C5 时间窗口 |
-| `SeckillLuaTest` | **P1 库存1000×10000并发**、售罄快速失败、活动结束瞬间全拒、F14 时钟只认 Redis、未预热拒绝、结果查询命中 Redis |
+| `SeckillLuaTest` | **P1 库存1000×10000并发**（含落库吞吐断言）、售罄快速失败、活动结束瞬间全拒、F14 时钟只认 Redis、未预热拒绝、结果查询命中 Redis |
+| `MqReliabilityTest` | **M1 只返回排队中**、M2 重复投递×10 仍 1 单（C6）、M3 消费端晚到不丢、M4 断开 MQ 堆积后重发（F4）、M5 重发耗尽即回补 |
+| `MqTopicConsistencyTest` | Topic/消费组的常量与配置项逐字一致（不需要容器） |
 | `SeckillRedisStockTest` | 取消回补 Redis 库存但保留资格、重复回补幂等、确定性失败不归还资格、售罄标记复位 |
 | `WarmupTest` | 重复预热不重置库存、元数据可覆盖、已结束活动预热不崩、`warmup_state` 置位、关闭活动同步 Redis |
 | `ActivityCacheTest` | 缓存命中、`serverTime`/库存不被缓存、空值缓存、逻辑过期后台重建、管理操作失效缓存、脏缓存自愈 |
@@ -105,9 +122,38 @@ mvn clean verify
 
 - [x] **阶段一** 基础业务闭环（纯 MySQL 同步链路）
 - [x] **阶段二** Redis 缓存 + Lua 原子判扣 + 四级限流
-- [ ] 阶段三 RocketMQ 异步化 + 本地消息表
+- [x] **阶段三** RocketMQ 异步化 + 本地消息表
 - [ ] 阶段四 补偿、对账、降级、监控
 - [ ] 阶段五 压测报告、故障演练报告、架构图
+
+### 阶段三做了什么
+
+秒杀接口不再等 MySQL。落库逻辑**仍然一行没改**——只是换了谁来调它：
+
+```
+Lua 原子判扣 → 本地消息表 + 投递 → 立刻返回「排队中」
+                                      ↓ 消费端
+                              OrderCreateService.handle（与阶段一同一个方法）
+                                      ↓ 同事务登记
+                              FSS_ORDER_CLOSE 定时消息（投递时刻 = expire_time）
+```
+
+- **五个 Topic / 四个消费者**：`ORDER_CREATE` 异步落库、`ORDER_CLOSE` 定时关单、
+  `STOCK_RELEASE` Redis 回补、`STOCK_ROLLBACK` 补偿回补、`%DLQ%GID_FSS_ORDER_CREATE`
+  死信兜底。队列数 16/4/4/4，`autoCreateTopicEnable=false` 显式建
+- **本地消息表两个入口**：`sendReliable`（事务外，先落库再发）与
+  `registerAfterCommit`（事务内登记、提交后投递）。后者让"订单已创建"与
+  "关单消息已登记"成为原子的
+- **任意时刻定时消息**关单，投递时刻取 `expire_time` 而不是"现在+15分钟"；
+  定时扫描退化为兜底（消息可能丢，而"订单永久待支付"不会自己暴露）
+- **幂等三层不变**：L1 `selectByRequestNo`、L2 `uk_request_no` /
+  `uk_activity_sku_user`、L3 状态条件更新。消费端只多做一个判断——
+  确定性失败立即回补并 ACK，可恢复异常抛出触发重试
+- **重发任务 + 死信消费者**：重试耗尽走 `onSendGiveUp` 回补（消息没发出去），
+  进死信走 `DlqListener` 回补（消息发出去了但处理不了）。两条路径的兜底完全不同
+- **traceId 跨 MQ 传递**：消息体带 `traceId`，消费端 `onMessage` 开头
+  `MDC.put`、`finally` 里 clear。实测一次关单的 5 条日志（ORDER_CLOSE 消费 →
+  DB 回补 → 登记 STOCK_RELEASE → Redis 回补 → ACK）共享同一个 traceId
 
 ### 阶段二做了什么
 
@@ -118,7 +164,6 @@ mvn clean verify
                                                               ↓ 失败
                                                         Lua 回补库存
 ```
-
 - **五段 Lua**：`seckill` 判扣 / `rollback` 补偿回补 / `release` 取消回补 /
   `write_result` 结论写入 / `token_bucket` 令牌桶。全部走 `EVALSHA`
 - **时间判定进了 Lua**，用 Redis `TIME`。`OrderCreateService` 里那份应用时钟的
@@ -181,23 +226,79 @@ Redis 与 Lettuce / Redisson 的分工是刻意的：Lua 与普通读写走 Lett
     `@Bean` 条件求值"这个实现细节。现在一个 `@Bean` 方法里用 `ObjectProvider`
     显式判断，更短也更好测。
 
+**阶段三**
+
+12. **`ReliableMqProducer` 拆成两个类**。它同时要 `RocketMQTemplate`（技术设施）和
+    `MqMessageMapper`（数据模型），而按 docs/01 的分层 `fss-infra` 只依赖
+    `fss-common`。让 infra 依赖 domain 会把两者的方向拧反，以后 domain 想用 infra
+    的工具就成环。现在 `MqSender`（infra）只负责发出去，`ReliableMqProducer`（biz）
+    负责落库与"发不出去该怎么办"——后者是业务决策：订单消息必须回补库存，
+    关单消息只需告警。
+13. **库存释放只把 Redis 那半挪进消息**。docs/05 把取消回补整个改成消息，但 DB 回补
+    **能**和关单同事务，所以必须同事务：拆出去之后消费端永久失败时，订单已是
+    CANCELLED 却永远拿不回库存，而"已取消"没法回滚成"待支付"。Redis 回补**不能**
+    加入 DB 事务，所以必须可重试——阶段二那种"提交后直接 INCRBY，失败只打日志"
+    期间就是实打实的少卖。
+14. **脚本 B 需要 `failStatus` 参数**。它原本固定把请求置成 5（"系统繁忙已退回"），
+    而消费端同时往 `t_seckill_request` 落一条 status=3（"已参与过"）。同一请求在
+    Redis 和 DB 里有两个结论，返回哪个取决于 TTL 到没到，而它偏向更坏的一边：
+    用户看到"系统繁忙"会不停重试。
+15. **捞待重发记录必须带 `send_count < max` 条件**。原写法是捞出来再判断次数、
+    超了就 `markFailed` 并跳过。只要有一次 `markFailed` 失败（DB 抖动），
+    那条记录就永远留在 `status = 0` 里，每 30 秒被捞一次、跳过一次；积累几万条后
+    每轮 200 条的配额全被占满，真正要发的新消息一条也捞不到。症状是
+    "重发任务在跑、日志不报错、消息就是发不出去"。现在拆成两次查询。
+16. **已消费回写要按 `(biz_key, topic)` 且只从"已发送"推进**。消费端只拿得到
+    RocketMQ 的 `KEYS`，拿不到 `msg_id`；同一个 requestNo 在多个 Topic 下各有一条
+    消息，只按 bizKey 会误更新另一条。允许从"待发送"推进则会让一条尚未发出的消息
+    被标成已消费，重发任务再也不碰它——投递意图就这么丢了。
+17. **消费端要能区分"回补失败"与"早就回补过了"**。脚本 C 对两者都返回非 0，
+    分不开的话重复投递会被当成失败无限重试，最后整批进死信——一个纯粹由
+    "把幂等命中误判成失败"造出来的故障。多查一次 `SISMEMBER released` 把两者分开。
+
 另修了一个阶段一联调时才暴露的缺陷：MySQL 容器默认时区 UTC，`NOW(3)` 与列
 `DEFAULT CURRENT_TIMESTAMP(3)` 写入的时间比 Java 侧写入的 `LocalDateTime`
 慢 8 小时。已在 compose 与 Testcontainers 两处统一加 `--default-time-zone=+08:00`，
 并补 `DatabaseTimezoneTest` 防止回归——原有用例抓不到它，因为断言的字段
 恰好都是 Java 侧写入的。
 
-### 阶段二已知限制
+### 阶段三踩到的三个环境坑
+
+与代码无关但会卡住整个阶段，记下来省下次的时间：
+
+- **RocketMQ 容器不能给 `/home/rocketmq/store` 挂命名卷**。镜像里这个目录不存在，
+  挂上去 Docker 会新建一个 root 所有的目录，而 broker 以 uid 3000 运行写不进去。
+  更糟的是 5.3.0 的失败路径本身有个 NPE
+  （`ScheduleMessageService.configFilePath`），真正的原因被那个 NPE 完全盖掉，
+  日志里只有一句 `NullPointerException`。
+- **broker 端口必须固定映射，不能用 Testcontainers 的随机端口**。broker 把
+  `brokerIP1:listenPort` 注册到 namesrv，客户端查到之后**直连**——随机映射时
+  客户端拿到的是容器内端口。症状是发送超时，日志只说 `sendDefaultImpl call timeout`。
+- **集成测试的属性要统一放进 `application-test.yml`**。属性只要有一处不同 Spring
+  就另起一个上下文，而每个上下文都会创建一套 RocketMQ 生产者与四个消费组。
+  分散在 `@TestPropertySource` 里时有 4 个上下文，跑到第 3 个就报
+  `java.lang.Error: IP Helper Library GetAdaptersAddresses failed with error == 1450`
+  （ERROR_NO_SYSTEM_RESOURCES：客户端每次实例化都要枚举网卡，而 Docker Desktop
+  会造出一大堆虚拟网卡）。合并成一个上下文顺带省掉两次启动。
+
+### 阶段三已知限制
 
 - **Redis 单点**（演示环境）。生产需哨兵或 Cluster；Key 已带 hash tag，上 Cluster
   无需改代码。
+- **单 broker、消息数据不持久化到卷**。见上面那条坑：要持久化就得 `user: root`，
+  为演示环境授这个权不值得。`stop`/`start` 数据保留，`down` 之后 Topic 需重建。
 - **Nginx 只提供配置未接入本地运行**。它要 `proxy_pass` 到两个 web 容器，
   本地开发时应用跑在宿主机上，所以 compose 里放在 `phase5` profile 默认不启动。
+- **积压监控与自动降级未接入**。docs/05 §7 的 `checkBacklog`（读消息积压后写
+  `degrade:level`）需要 `DefaultMQAdminExt`，与三类对账任务一起放在阶段四。
+  `DegradeSwitch` 目前只有配置项形式的总开关。
 - **Redis 调用超时的不确定结果只记日志**。此时无法确定脚本是否已执行，
   对用户报"系统繁忙"，库存差额留给阶段四的对账任务收敛。完整的 `checkUncertain`
-  需要 `t_reconcile_task` 真正跑起来，属于阶段四。
-- **秒杀仍是同步落库**。这是阶段二的设计意图：单独验证 Lua 的正确性，
-  不被 MQ 的异步性干扰。
+  需要 `t_reconcile_task` 真正跑起来。
+- **补偿回补目前是直接调用而非发消息**。`FSS_STOCK_ROLLBACK` 的生产者与消费者都已
+  就位（重发放弃、死信兜底两条路径），但主链路上的确定性失败是消费端就地回补的——
+  它已经在自己的线程里，多绕一次 MQ 只增加延迟。走消息的价值在"Redis 也不可用"
+  那种场景，属于阶段四的降级演练。
 - **令牌串错误时令牌也会被消费**。`GETDEL` 没有"比对不上就别删"这个选项，
   这是接受它的原子性所付的代价。key 由已认证的 userId 推出，攻击者只能作废自己的令牌。
 "# flash_sale_system" 

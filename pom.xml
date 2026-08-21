@@ -34,7 +34,6 @@
         <testcontainers.version>1.20.3</testcontainers.version>
         <redisson.version>3.36.0</redisson.version>
         <sentinel.version>1.8.8</sentinel.version>
-        <!-- 以下版本在阶段三接入时启用 -->
         <rocketmq-spring.version>2.3.1</rocketmq-spring.version>
     </properties>
 
@@ -113,6 +112,30 @@
                 <groupId>com.alibaba.csp</groupId>
                 <artifactId>sentinel-annotation-aspectj</artifactId>
                 <version>${sentinel.version}</version>
+            </dependency>
+
+            <!--
+                rocketmq-spring-boot-starter 2.3.1 是<b>针对 Spring Boot 2.7 编译</b>的
+                （其 parent 声明 spring.boot.version=2.7.18、java.version=1.8）。
+                在 Boot 3.3 上能用，靠的是两件事，缺一件都不行：
+                  1. 它把 spring-boot / spring-boot-autoconfigure 声明为 optional，
+                     实际版本由本项目的 BOM 决定，不会把 2.7 拖进来；
+                  2. 它已经提供 META-INF/spring/*.AutoConfiguration.imports
+                     （Boot 2.7 引入、Boot 3 唯一认的自动装配清单）。
+                并且它整个包不碰 javax.servlet / javax.annotation —— 只做生产者与
+                消费者的生命周期管理，没有 jakarta 迁移的表面。
+                我们仍然显式排除它传递进来的 jackson，避免它 2.11 的版本压过 BOM 里的。
+            -->
+            <dependency>
+                <groupId>org.apache.rocketmq</groupId>
+                <artifactId>rocketmq-spring-boot-starter</artifactId>
+                <version>${rocketmq-spring.version}</version>
+                <exclusions>
+                    <exclusion>
+                        <groupId>com.fasterxml.jackson.core</groupId>
+                        <artifactId>jackson-databind</artifactId>
+                    </exclusion>
+                </exclusions>
             </dependency>
 
             <dependency>

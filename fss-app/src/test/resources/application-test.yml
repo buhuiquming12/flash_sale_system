@@ -39,6 +39,24 @@ fss:
     secret: fss-integration-test-secret-at-least-32-bytes-long
   pay:
     notify-secret: fss-integration-test-pay-secret
+  job:
+    # 全部定时任务设成"每年 1 月 1 日"，测试期间不会自动触发，由用例显式调用。
+    #
+    # 放在这里而不是各测试类的 @TestPropertySource 里，是为了让所有集成测试
+    # <b>共用同一个 Spring 上下文</b>。属性只要有一处不同，Spring 就会另起一个上下文，
+    # 而每个上下文都会创建一套 RocketMQ 生产者与四个消费组。
+    # 之前分散在 @TestPropertySource 里时有 4 个上下文，Windows 上跑到第 3 个就报
+    # java.lang.Error: IP Helper Library GetAdaptersAddresses failed with error == 1450
+    # （ERROR_NO_SYSTEM_RESOURCES：RocketMQ 客户端每次实例化都要枚举一遍网卡，
+    # 而 Docker Desktop 会造出一大堆虚拟网卡）。合并成一个上下文顺带省掉两次启动
+    close-expired-cron: "0 0 0 1 1 ?"
+    activity-state-cron: "0 0 0 1 1 ?"
+    warmup-cron: "0 0 0 1 1 ?"
+    # 重发任务用 fixedDelay，没有 cron 可关，设成一天
+    mq-resend-delay-ms: 86400000
+  mq:
+    # 调小重发上限：测"耗尽后回补"时不用等 5 轮
+    max-resend: 2
   sentinel:
     # 必须关掉。并发用例会在几秒内打上万次 submit，撞上 QPS 阈值后
     # 失败原因变成 RATE_LIMITED，"是否超卖"的断言就被污染成"限流是否生效"了。
@@ -48,3 +66,10 @@ fss:
     # 集成测试直接调 Service，不经过 Web 层，拦截器本来就不生效；
     # 显式关掉是为了让"为什么并发用例没被限流"这件事在配置里就能看明白
     enabled: false
+
+rocketmq:
+  name-server: 127.0.0.1:9877   # 由 IntegrationTestBase 的 @DynamicPropertySource 覆盖
+  producer:
+    group: PID_FSS_TEST
+    send-message-timeout: 3000
+    retry-times-when-send-failed: 1

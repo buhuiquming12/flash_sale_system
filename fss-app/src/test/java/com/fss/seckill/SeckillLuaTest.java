@@ -60,6 +60,11 @@ class SeckillLuaTest extends IntegrationTestBase {
         assertThat(fixture.redisStock(act.activityId(), act.skuId()))
                 .as("Redis 库存必须归零，且绝不能为负")
                 .isZero();
+
+        // 阶段三多了一条验收：订单要异步落库，且消费端跟得上。
+        // 用轮询等待而不是固定 sleep——固定 sleep 在 CI 上必然随机失败，
+        // 给短了没处理完，给长了每个用例白等
+        long landed = fixture.awaitOrders(act.activityId(), act.skuId(), stock);
         assertThat(fixture.countOrders(act.activityId(), act.skuId())).isEqualTo(stock);
 
         TestFixture.StockSnapshot s = fixture.stock(act.activityId(), act.skuId());
@@ -68,6 +73,22 @@ class SeckillLuaTest extends IntegrationTestBase {
         assertThat(s.identityHolds())
                 .as("库存等式 total = available + locked + sold 必须成立: %s", s)
                 .isTrue();
+
+        // 断言<b>吞吐</b>而不是 docs/08 写的"3s 内全部落库"。
+        //
+        // 那个 3s 是给独立部署的压测环境定的（docs/08 §3 的调优清单第 5 条明说
+        // 压测机要独立部署）。这里 Testcontainers 的 MySQL、被测应用、1 万个测试线程
+        // 抢同一台开发机的 CPU，而且 Windows 上 Docker 的磁盘要过一层 WSL2，
+        // 每个订单是 11 条 SQL + 一次提交，实测约 60 单/秒。
+        //
+        // 换成吞吐是因为它能真正抓到回归而不只是反映机器忙不忙：
+        // 有人把 consumeThreadNumber 改成 1、或者在消费链路里加了一次同步 HTTP 调用，
+        // 吞吐会掉到个位数。而卡一个绝对墙钟时间只会让这个用例在忙的机器上乱红。
+        double tps = stock * 1000.0 / Math.max(landed, 1);
+        assertThat(tps)
+                .as("1000 单落库耗时 %dms → %.0f 单/秒。低于 20 说明消费端真的有瓶颈，"
+                        + "而不只是机器忙", landed, tps)
+                .isGreaterThan(20.0);
     }
 
     @Test
@@ -170,8 +191,7 @@ class SeckillLuaTest extends IntegrationTestBase {
 
         // 补预热后立刻恢复可用（对应 F2：Redis 数据丢失后人工补数据）
         fixture.warmup(act.activityId());
-        SeckillSubmitVO vo = seckillService.submit(
-                SeckillCmd.of(act.activityId(), act.skuId(), 1), userId);
+        SeckillSubmitVO vo = fixture.submitAndAwait(act, userId);
         assertThat(vo.getOrderNo()).isNotBlank();
         assertThat(fixture.redisStock(act.activityId(), act.skuId())).isEqualTo(9L);
     }
@@ -194,6 +214,7 @@ class SeckillLuaTest extends IntegrationTestBase {
                 .as("Lua 先判 bought 再扣库存，所以失败的 49 次一次都没碰过库存")
                 .isEqualTo(1L);
         assertThat(fixture.redisStock(act.activityId(), act.skuId())).isEqualTo(99L);
+        fixture.awaitOrders(act.activityId(), act.skuId(), 1);
         assertThat(fixture.countOrders(act.activityId(), act.skuId())).isEqualTo(1);
     }
 
@@ -204,8 +225,7 @@ class SeckillLuaTest extends IntegrationTestBase {
         long u1 = fixture.createUser();
         long u2 = fixture.createUser();
 
-        SeckillSubmitVO ok = seckillService.submit(
-                SeckillCmd.of(act.activityId(), act.skuId(), 1), u1);
+        SeckillSubmitVO ok = fixture.submitAndAwait(act, u1);
 
         SeckillResultVO r = seckillService.queryResult(
                 ok.getRequestNo(), act.activityId(), act.skuId(), u1);
@@ -228,7 +248,7 @@ class SeckillLuaTest extends IntegrationTestBase {
         long u1 = fixture.createUser();
         long u2 = fixture.createUser();
 
-        seckillService.submit(SeckillCmd.of(act.activityId(), act.skuId(), 1), u1);
+        fixture.submitAndAwait(act, u1);
 
         // u2 撞上库存不足。Lua 在库存校验那一步就 return 了，没有创建 req key，
         // 所以结论是服务端补写进去的

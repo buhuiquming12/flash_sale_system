@@ -183,7 +183,9 @@ async function seckill(activityId, skuId, btn) {
     if (d.status === 1) {
       alert('秒杀成功！订单号 ' + d.orderNo + '\n请在 15 分钟内完成支付');
     } else {
-      // 阶段三异步化后走这条分支：轮询 /api/seckill/result
+      // 阶段三起走的都是这条分支：接口只返回"排队中"，订单由消费端异步建。
+      // pollAfterMs 由服务端下发而不是前端硬编码 —— 降级时后端把它从 300 拉到 2000，
+      // 不用发版就能把结果接口的压力降一个数量级
       await poll(d.requestNo, activityId, skuId, d.pollAfterMs || 300);
     }
   } catch (e) {
@@ -195,7 +197,12 @@ async function seckill(activityId, skuId, btn) {
   }
 }
 
-/** 退避轮询：300/500/800/1300/2000ms 后固定 2000ms，累计 20s 放弃 */
+/**
+ * 退避轮询：300/500/800/1300/2000ms 后固定 2000ms，累计 20s 放弃。
+ *
+ * 退避而不是固定间隔：绝大多数请求在第一次轮询时就有结论了，
+ * 固定 300ms 轮询会让那些真的要等几秒的请求白打十几次。
+ */
 async function poll(requestNo, activityId, skuId, firstDelay) {
   const delays = [firstDelay, 500, 800, 1300, 2000];
   let elapsed = 0, i = 0;
@@ -208,7 +215,9 @@ async function poll(requestNo, activityId, skuId, firstDelay) {
     const r = await api('/api/seckill/result?requestNo=' + encodeURIComponent(requestNo)
                         + '&activityId=' + activityId + '&skuId=' + skuId);
     if (r.status === 0) continue;
-    if (r.status === 1) { alert('秒杀成功！订单号 ' + r.orderNo); return; }
+    if (r.status === 1) { alert('秒杀成功！订单号 ' + r.orderNo + '\n请在 15 分钟内完成支付'); return; }
+    // 失败结论一定拿得到：Lua 拒绝的会被服务端补写，消费端失败的由补偿回补写入。
+    // 这两条路径都写具体状态而不是笼统的"系统繁忙"，用户才知道要不要重试
     alert('秒杀失败：' + (r.failReason || r.statusDesc)); return;
   }
   alert('结果查询超时，请到订单列表确认');

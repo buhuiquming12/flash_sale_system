@@ -18,7 +18,6 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
-import org.springframework.test.context.TestPropertySource;
 
 import java.time.LocalDateTime;
 
@@ -27,15 +26,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * 定时任务验收。
  *
- * <p>激活 {@code job} profile 以装配任务 Bean，但把 cron 设成"每年 1 月 1 日"
- * 让它在测试期间不会自动触发——由测试显式调用。<b>不这样做的话，任务会在测试断言
- * 之间随机把订单关掉</b>，产生只在 CI 上偶发的失败。
+ * <p>激活 {@code job} profile 以装配任务 Bean。cron 在 application-test.yml 里
+ * 统一设成"每年 1 月 1 日"，测试期间不会自动触发——由测试显式调用。
+ * <b>不这样做的话，任务会在测试断言之间随机把订单关掉</b>，产生只在 CI 上偶发的失败。
+ *
+ * <p>那几个属性放在配置文件而不是这里的 {@code @TestPropertySource}：属性只要有一处
+ * 与别的测试类不同，Spring 就会另起一个上下文，而每个上下文都要创建一套
+ * RocketMQ 生产者和四个消费组。见 application-test.yml 里 fss.job 那段注释。
  */
-@ActiveProfiles({"test", "job"})
-@TestPropertySource(properties = {
-        "fss.job.close-expired-cron=0 0 0 1 1 ?",
-        "fss.job.activity-state-cron=0 0 0 1 1 ?",
-        "fss.job.warmup-cron=0 0 0 1 1 ?"})
+@ActiveProfiles({"test", "consumer", "job"})
 class ScheduledJobTest extends IntegrationTestBase {
 
     @Autowired OrderCloseJob     orderCloseJob;
@@ -51,13 +50,13 @@ class ScheduledJobTest extends IntegrationTestBase {
     void 超时关单() {
         TestFixture.Activity act = fixture.createRunningActivity(10);
         long userId = fixture.createUser();
-        SeckillSubmitVO vo = seckillService.submit(
-                SeckillCmd.of(act.activityId(), act.skuId(), 1), userId);
+        SeckillSubmitVO vo = fixture.submitAndAwait(act, userId);
 
         assertThat(fixture.availableStock(act.activityId(), act.skuId())).isEqualTo(9);
 
         fixture.expireOrder(vo.getOrderNo());
         orderCloseJob.closeExpiredOrders();
+        fixture.awaitRedisStock(act.activityId(), act.skuId(), 10L);
 
         OrderVO order = orderService.detail(vo.getOrderNo(), userId);
         assertThat(order.getStatus()).isEqualTo(OrderStatus.CANCELLED.code());
@@ -75,8 +74,7 @@ class ScheduledJobTest extends IntegrationTestBase {
     void 未过期订单不动() {
         TestFixture.Activity act = fixture.createRunningActivity(10);
         long userId = fixture.createUser();
-        SeckillSubmitVO vo = seckillService.submit(
-                SeckillCmd.of(act.activityId(), act.skuId(), 1), userId);
+        SeckillSubmitVO vo = fixture.submitAndAwait(act, userId);
 
         orderCloseJob.closeExpiredOrders();
 
@@ -90,13 +88,13 @@ class ScheduledJobTest extends IntegrationTestBase {
     void 扫描可重复执行() {
         TestFixture.Activity act = fixture.createRunningActivity(10);
         long userId = fixture.createUser();
-        SeckillSubmitVO vo = seckillService.submit(
-                SeckillCmd.of(act.activityId(), act.skuId(), 1), userId);
+        SeckillSubmitVO vo = fixture.submitAndAwait(act, userId);
 
         fixture.expireOrder(vo.getOrderNo());
         for (int i = 0; i < 3; i++) {
             orderCloseJob.closeExpiredOrders();
         }
+        fixture.awaitRedisStock(act.activityId(), act.skuId(), 10L);
 
         TestFixture.StockSnapshot s = fixture.stock(act.activityId(), act.skuId());
         assertThat(s.available()).isEqualTo(10);
@@ -178,7 +176,7 @@ class ScheduledJobTest extends IntegrationTestBase {
     void 预热任务可重复执行() {
         TestFixture.Activity act = fixture.createRunningActivity(10);
         long userId = fixture.createUser();
-        seckillService.submit(SeckillCmd.of(act.activityId(), act.skuId(), 1), userId);
+        fixture.submitAndAwait(act, userId);
         assertThat(fixture.redisStock(act.activityId(), act.skuId())).isEqualTo(9L);
 
         // 把活动改回"待开始且未预热"，让预热任务重新捞到它

@@ -41,11 +41,14 @@ class SeckillRedisStockTest extends IntegrationTestBase {
         TestFixture.Activity act = fixture.createRunningActivity(10);
         long userId = fixture.createUser();
 
-        SeckillSubmitVO vo = seckillService.submit(
-                SeckillCmd.of(act.activityId(), act.skuId(), 1), userId);
+        SeckillSubmitVO vo = fixture.submitAndAwait(act, userId);
         assertThat(fixture.redisStock(act.activityId(), act.skuId())).isEqualTo(9L);
 
         orderService.cancel(vo.getOrderNo(), userId);
+        // 阶段三把 Redis 回补挪进了 FSS_STOCK_RELEASE 消息（换来 5 次退避重试 +
+        // 死信兜底，而阶段二失败了只能记日志等对账），所以 cancel 返回时
+        // Redis 还没加回来。DB 那半仍与关单同事务，下面的 DB 断言不需要等
+        fixture.awaitRedisStock(act.activityId(), act.skuId(), 10L);
 
         assertThat(fixture.redisStock(act.activityId(), act.skuId()))
                 .as("库存要回池给其他用户")
@@ -72,12 +75,12 @@ class SeckillRedisStockTest extends IntegrationTestBase {
     void R2_重复回补幂等() {
         TestFixture.Activity act = fixture.createRunningActivity(10);
         long userId = fixture.createUser();
-        SeckillSubmitVO vo = seckillService.submit(
-                SeckillCmd.of(act.activityId(), act.skuId(), 1), userId);
+        SeckillSubmitVO vo = fixture.submitAndAwait(act, userId);
 
         for (int i = 0; i < 10; i++) {
             orderService.closeOrder(vo.getOrderNo(), "重复关单测试");
         }
+        fixture.awaitRedisStock(act.activityId(), act.skuId(), 10L);
 
         assertThat(fixture.redisStock(act.activityId(), act.skuId()))
                 .as("DB 侧的 stock_released 条件更新只能保证 DB 不重复回补，"
@@ -93,7 +96,7 @@ class SeckillRedisStockTest extends IntegrationTestBase {
         TestFixture.Activity act = fixture.createRunningActivity(10);
         long userId = fixture.createUser();
 
-        seckillService.submit(SeckillCmd.of(act.activityId(), act.skuId(), 1), userId);
+        fixture.submitAndAwait(act, userId);
         assertThat(fixture.redisStock(act.activityId(), act.skuId())).isEqualTo(9L);
 
         // 模拟 Redis 购买标记丢失（主从切换丢了 1 秒数据、或有人手动删了 key），
@@ -102,9 +105,10 @@ class SeckillRedisStockTest extends IntegrationTestBase {
                 String.valueOf(userId));
         assertThat(fixture.redisBought(act.activityId(), act.skuId(), userId)).isZero();
 
-        // Lua 放行（它看不到标记了）→ 预扣成功 → 落库撞 uk_activity_sku_user
-        assertThatThrownBy(() -> seckillService.submit(
-                SeckillCmd.of(act.activityId(), act.skuId(), 1), userId))
+        // Lua 放行（它看不到标记了）→ 预扣成功 → 落库撞 uk_activity_sku_user。
+        // 阶段三这次失败发生在<b>消费端</b>，所以错误码是轮询结论反推出来的 ——
+        // 无论拒绝发生在 Lua 还是消费端，对调用者都必须是同一个码
+        assertThatThrownBy(() -> fixture.submitAndAwait(act, userId))
                 .isInstanceOf(BizException.class)
                 .extracting(e -> ((BizException) e).getErrorCode())
                 .isEqualTo(ErrorCode.ALREADY_BOUGHT);
@@ -136,11 +140,11 @@ class SeckillRedisStockTest extends IntegrationTestBase {
         long u1 = fixture.createUser();
         long u2 = fixture.createUser();
 
-        SeckillSubmitVO vo = seckillService.submit(
-                SeckillCmd.of(act.activityId(), act.skuId(), 1), u1);
+        SeckillSubmitVO vo = fixture.submitAndAwait(act, u1);
         assertThat(fixture.redisGoodsStatus(act.activityId(), act.skuId())).isEqualTo(2);
 
         orderService.cancel(vo.getOrderNo(), u1);
+        fixture.awaitRedisStock(act.activityId(), act.skuId(), 1L);
 
         assertThat(fixture.redisGoodsStatus(act.activityId(), act.skuId()))
                 .as("不把 status 改回 1 的话，库存回补了也没人抢得到 —— "
@@ -149,9 +153,7 @@ class SeckillRedisStockTest extends IntegrationTestBase {
         assertThat(fixture.redisStock(act.activityId(), act.skuId())).isEqualTo(1L);
 
         // 另一个用户能抢到回池的库存（决策 1：原用户资格已消耗，库存归其他人）
-        assertThat(seckillService.submit(
-                SeckillCmd.of(act.activityId(), act.skuId(), 1), u2).getOrderNo())
-                .isNotBlank();
+        assertThat(fixture.submitAndAwait(act, u2).getOrderNo()).isNotBlank();
     }
 
     @Test
@@ -159,7 +161,7 @@ class SeckillRedisStockTest extends IntegrationTestBase {
     void R5_支付不重复扣Redis() {
         TestFixture.Activity act = fixture.createRunningActivity(10);
         long userId = fixture.createUser();
-        seckillService.submit(SeckillCmd.of(act.activityId(), act.skuId(), 1), userId);
+        fixture.submitAndAwait(act, userId);
 
         Long before = fixture.redisStock(act.activityId(), act.skuId());
         assertThat(before).isEqualTo(9L);

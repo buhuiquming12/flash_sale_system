@@ -347,8 +347,15 @@ class OrderLifecycleTest extends IntegrationTestBase {
 
     // ------------------------------------------------------------------
 
+    /**
+     * 阶段三起秒杀是异步落库的，接口返回"排队中"而不是订单号。
+     *
+     * <p>这批用例的断言<b>一个字都没改</b>——它们验的是"取消要回补、支付要转 sold、
+     * 越权要拒绝"这些对外行为，与订单是同步还是异步建出来的无关。
+     * 变的只有这一行：等到消费端把订单建好再往下走。
+     */
     private SeckillSubmitVO submit(TestFixture.Activity act, long userId) {
-        return seckillService.submit(SeckillCmd.of(act.activityId(), act.skuId(), 1), userId);
+        return fixture.submitAndAwait(act, userId);
     }
 
     private PayCreateCmd payCmd(String orderNo) {

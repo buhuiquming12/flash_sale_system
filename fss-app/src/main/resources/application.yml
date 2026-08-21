@@ -53,6 +53,33 @@ spring:
   lifecycle:
     timeout-per-shutdown-phase: 20s
 
+# ---------------------------------------------------------------------
+# RocketMQ。
+#
+# name-server 与 producer.group 是<b>所有角色</b>都要的：web 角色发消息，
+# consumer 角色发补偿消息，job 角色重发消息。没有一个角色是纯消费者。
+#
+# 注意 rocketmq-spring 的自动装配条件是「配了 name-server 且配了 producer.group」，
+# 少一个就不会创建 RocketMQTemplate，而症状是启动时报
+# "No qualifying bean of type RocketMQTemplate" —— 不会提示你少配了什么。
+# ---------------------------------------------------------------------
+rocketmq:
+  name-server: ${FSS_MQ_NAMESRV:127.0.0.1:9876}
+  producer:
+    group: PID_FSS_PRODUCER
+    # 与 fss.mq.send-timeout 保持一致。给短是因为秒杀链路上的发送在请求线程里，
+    # 超时给长了 Tomcat 线程会堆在等 broker 上——和 Redis 超时一样的道理
+    send-message-timeout: 2000
+    # 发送失败时客户端自己重试的次数。给 1 而不是默认的 2：
+    # 真正的重试兜底是本地消息表 + 重发任务，客户端在请求线程里多重试一次
+    # 只会让接口 RT 翻倍。快速失败交给重发任务更好
+    retry-times-when-send-failed: 1
+    # 4MB 以下不压缩。消息体只有几个 ID，压缩纯属浪费 CPU
+    compress-message-body-threshold: 4096
+  consumer:
+    # 一次 pull 拉多少条。与 consumeThreadNumber 配合决定单实例吞吐
+    pull-batch-size: 16
+
 mybatis-plus:
   configuration:
     map-underscore-to-camel-case: true
@@ -137,6 +164,8 @@ fss:
   degrade:
     seckill-enabled: true
     backlog-threshold: 50000
+    # 下发给客户端的轮询间隔。降级 Level 2 时拉到 2000，不用发版
+    poll-interval-ms: 300
   jwt:
     # 生产必须由环境变量 FSS_JWT_SECRET 注入
     secret: ${FSS_JWT_SECRET:fss-local-dev-only-secret-change-me-in-prod}
@@ -149,3 +178,4 @@ fss:
     close-expired-cron: "0 */2 * * * ?"
     activity-state-cron: "0 * * * * ?"
     warmup-cron: "0 * * * * ?"
+    mq-resend-delay-ms: 30000

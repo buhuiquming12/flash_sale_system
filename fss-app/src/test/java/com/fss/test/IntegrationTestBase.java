@@ -9,37 +9,53 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.MySQLContainer;
+import org.testcontainers.containers.Network;
+import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
+import org.testcontainers.utility.MountableFile;
+
+import java.time.Duration;
 
 /**
  * 集成测试基类。
  *
- * <p><b>用 Testcontainers 起真实 MySQL 与真实 Redis，不用 H2、不用嵌入式 Redis。</b>
+ * <p><b>用 Testcontainers 起真实 MySQL、真实 Redis、真实 RocketMQ，
+ * 不用 H2、不用嵌入式 Redis、不用 Mock 的 RocketMQTemplate。</b>
  * H2 的 {@code CHECK} 约束、行锁语义、唯一键冲突时的错误信息都和 MySQL 不同；
- * 嵌入式 Redis（embedded-redis 之类）对 Lua 的支持是残缺的——
- * {@code redis.call('TIME')} 在写脚本里能不能用、返回值精度多少，
- * 各家实现都不一样。而这两样恰好是本项目防超卖的全部依赖：
- * 在替代品上测过了不代表真环境对。
+ * 嵌入式 Redis 对 Lua 的支持是残缺的（{@code redis.call('TIME')} 在写脚本里
+ * 能不能用、返回值精度多少，各家实现都不一样）；而 Mock 掉 MQ 之后，
+ * 阶段三真正要验的那些东西——重复投递、消费失败重试、进死信、定时消息按时投递——
+ * 一个都验不到，剩下的只是"我调用了 send 方法"。
  *
  * <p>容器用 {@code static} 且不显式 stop：Testcontainers 的 ryuk 会在 JVM 退出时
- * 清理，多个测试类共享同一个容器，避免每个类都付一次启动时间。
+ * 清理，多个测试类共享同一套容器，避免每个类都付一次启动时间（RocketMQ 尤其贵）。
  *
- * <p>{@code classes = FssApplication.class} 是必需的：测试类在 {@code com.fss.seckill}
- * 等包下，Spring Boot 从测试包逐级向上找 {@code @SpringBootConfiguration}，
- * 而启动类在 {@code com.fss.app} —— 找不到就报
- * "Unable to find a @SpringBootConfiguration"。
+ * <h3>为什么 RocketMQ 不能用 Testcontainers 的随机端口</h3>
+ * broker 把 {@code brokerIP1:listenPort} 注册到 namesrv，客户端从 namesrv
+ * 查到这个地址后<b>直连 broker</b>。随机映射时客户端拿到的是容器内端口，连不上——
+ * 症状是发送超时，而日志里只说 "sendDefaultImpl call timeout"，
+ * 完全看不出是端口的问题。所以这里固定宿主端口，并刻意错开
+ * docker-compose 用的 9876/10911，让 {@code mvn verify} 和联调环境能同时活着。
  *
- * <p>profile 故意<b>不</b>包含 {@code job}：定时任务在测试中途把订单关掉会造成
- * 难以复现的间歇性失败。需要验证关单逻辑的用例直接调 Service。
+ * <p>profile 包含 {@code consumer}：阶段三起订单是消费端建的，
+ * 不激活它的话所有秒杀都会永远停在"排队中"。仍然<b>不</b>包含 {@code job}——
+ * 定时任务在测试中途把订单关掉会造成难以复现的间歇性失败，
+ * 需要它的用例自己加（见 {@code ScheduledJobTest}）。
  */
 @Tag("integration")
 @Testcontainers
-@ActiveProfiles("test")
+@ActiveProfiles({"test", "consumer"})
 @SpringBootTest(classes = FssApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.NONE)
 @Import(TestFixture.class)
 public abstract class IntegrationTestBase {
+
+    /** 宿主侧端口，刻意错开 docker-compose 用的 9876 / 10911 */
+    private static final int MQ_NAMESRV_PORT = 9877;
+    private static final int MQ_BROKER_PORT  = 10921;
+    /** namesrv 在容器里的监听端口写死在 mqnamesrv 脚本里，改不了 */
+    private static final int MQ_NAMESRV_CONTAINER_PORT = 9876;
 
     static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.0")
             .withDatabaseName("flash_sale")
@@ -67,10 +83,67 @@ public abstract class IntegrationTestBase {
                     .withCommand("redis-server", "--maxmemory-policy", "noeviction")
                     .withReuse(true);
 
+    /**
+     * MQ 专用的用户自定义网络。
+     *
+     * <p>必须显式建而不是用默认 bridge：默认 bridge 里<b>没有 DNS</b>，
+     * broker 解析不了 namesrv 的别名。用户自定义网络才有内置 DNS。
+     */
+    private static final Network MQ_NET = Network.newNetwork();
+
+    static final GenericContainer<?> MQ_NAMESRV =
+            new GenericContainer<>(DockerImageName.parse("apache/rocketmq:5.3.0"))
+                    .withNetwork(MQ_NET)
+                    // broker-test.conf 里 namesrvAddr = mq-namesrv:9876 靠这个别名解析
+                    .withNetworkAliases("mq-namesrv")
+                    .withCommand("sh", "mqnamesrv")
+                    // 默认 -Xms4g，普通开发机直接 OOM 起不来
+                    .withEnv("JAVA_OPT_EXT", "-Xms128m -Xmx256m -Xmn128m")
+                    .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
+                            .withPortBindings(fixedBinding(
+                                    MQ_NAMESRV_PORT, MQ_NAMESRV_CONTAINER_PORT)))
+                    .waitingFor(Wait.forLogMessage(".*Name Server boot success.*\\n", 1)
+                            .withStartupTimeout(Duration.ofMinutes(3)));
+
+    static final GenericContainer<?> MQ_BROKER =
+            new GenericContainer<>(DockerImageName.parse("apache/rocketmq:5.3.0"))
+                    .withNetwork(MQ_NET)
+                    .withCopyFileToContainer(
+                            MountableFile.forClasspathResource("rocketmq/broker-test.conf"),
+                            "/home/rocketmq/broker-test.conf")
+                    .withCommand("sh", "mqbroker", "-c", "/home/rocketmq/broker-test.conf")
+                    .withEnv("JAVA_OPT_EXT", "-Xms256m -Xmx512m -Xmn128m")
+                    .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
+                            // broker 的 listenPort 由 broker-test.conf 指定为 10921，
+                            // 容器内外同号，所以这里两个参数一样
+                            .withPortBindings(fixedBinding(
+                                    MQ_BROKER_PORT, MQ_BROKER_PORT)))
+                    .waitingFor(Wait.forLogMessage(".*boot success.*\\n", 1)
+                            .withStartupTimeout(Duration.ofMinutes(3)));
+
     static {
         MYSQL.start();
         REDIS.start();
+        // 顺序：broker 启动时要连 namesrv 注册自己
+        MQ_NAMESRV.start();
+        MQ_BROKER.start();
         flushRedis();
+    }
+
+    /**
+     * 宿主端口 → 容器端口的<b>固定</b>映射。见类注释里为什么不能随机映射。
+     *
+     * <p>两个端口号刻意分开传：namesrv 在容器里永远监听 9876（写死在
+     * {@code mqnamesrv} 里），而宿主侧要用 9877 才不跟 docker-compose 的那套撞。
+     * 早先写成 9877→9877 时容器里根本没有进程监听 9877，
+     * 症状是客户端报 "send request to /127.0.0.1:9877 failed"，
+     * 看起来像网络不通，其实是端口映射到了一个空端口。
+     */
+    private static com.github.dockerjava.api.model.PortBinding fixedBinding(
+            int hostPort, int containerPort) {
+        return new com.github.dockerjava.api.model.PortBinding(
+                com.github.dockerjava.api.model.Ports.Binding.bindPort(hostPort),
+                new com.github.dockerjava.api.model.ExposedPort(containerPort));
     }
 
     /**
@@ -96,5 +169,6 @@ public abstract class IntegrationTestBase {
         registry.add("spring.datasource.password", MYSQL::getPassword);
         registry.add("spring.data.redis.host", REDIS::getHost);
         registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
+        registry.add("rocketmq.name-server", () -> "127.0.0.1:" + MQ_NAMESRV_PORT);
     }
 }

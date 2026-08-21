@@ -62,25 +62,42 @@ services:
       - "6379:6379"
 
   rocketmq-namesrv:
-    image: apache/rocketmq:5.2.0
+    image: apache/rocketmq:5.3.0
     container_name: fss-rmq-namesrv
     profiles: ["phase3"]
     command: sh mqnamesrv
+    # namesrv 默认要 -Xms4g，普通开发机上直接 OOM 起不来
+    environment:
+      JAVA_OPT_EXT: "-Xms256m -Xmx256m -Xmn128m"
     ports:
       - "9876:9876"
 
   rocketmq-broker:
-    image: apache/rocketmq:5.2.0
+    image: apache/rocketmq:5.3.0
     container_name: fss-rmq-broker
     profiles: ["phase3"]
     command: sh mqbroker -c /home/rocketmq/conf/broker.conf
     depends_on:
       - rocketmq-namesrv
+    environment:
+      JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m"
     volumes:
       - ./docker/rocketmq/broker.conf:/home/rocketmq/conf/broker.conf:ro
+    # 刻意<b>不</b>给 store 挂命名卷。镜像里 /home/rocketmq/store 并不存在，
+    # 挂上去 Docker 会新建一个 root 所有的空目录，而 broker 以 uid 3000 运行，
+    # 写不进去 → 初始化失败。更糟的是 5.3.0 的失败路径本身有个 NPE
+    # （ScheduleMessageService.configFilePath），真正的原因被那个 NPE 盖掉了，
+    # 日志里只看到一句 NullPointerException。
+    # 想持久化就得 user: root，为一个演示环境授这个权不值得——
+    # 消息数据留在容器可写层，stop/start 保留，down 之后重建（连带 Topic 要重建）
+    # 端口必须<b>固定映射</b>，不能让 Docker 随机分配。broker 通过 namesrv 把
+    # 「brokerIP1:listenPort」告诉客户端，客户端拿到这个地址后直连 broker。
+    # 宿主端口与容器端口不一致时，客户端拿到的是容器内的端口号，连不上。
+    # 10909 是 VIP 通道，10912 是 HA 通道（listenPort+1 / +2，由 broker 自己算）
     ports:
       - "10909:10909"
       - "10911:10911"
+      - "10912:10912"
 
   # 四级限流的第一级。只在多实例部署形态下才有意义（它要 proxy_pass 到
   # fss-web-1 / fss-web-2 两个容器），本地开发时应用跑在宿主机上，

@@ -114,10 +114,15 @@ public class SeckillExecutor {
      * @param keepBought true 时<b>不</b>归还用户购买资格。落库失败原因是
      *                   {@code ALREADY_BOUGHT} 时必须传 true，否则用户重抢 →
      *                   DB 又冲突 → 又回补，形成死循环
+     * @param failStatus 写入请求记录的终态。确定性失败写具体码，只有系统原因才写
+     *                   {@code COMPENSATED} —— 设计文档一律写 5，而消费端同时会往
+     *                   {@code t_seckill_request} 落一条具体码，同一个请求在 Redis
+     *                   和 DB 里就有了两个不同的结论
      * @return true 表示本次真的回补了；false 表示幂等命中（已回补过或状态不允许）
      */
     public boolean rollback(long activityId, long skuId, long userId, int qty,
-                            String requestNo, String reason, boolean keepBought) {
+                            String requestNo, String reason, boolean keepBought,
+                            SeckillRequestStatus failStatus) {
         List<String> keys = List.of(
                 RedisKeys.stock(activityId, skuId),
                 RedisKeys.bought(activityId, skuId),
@@ -128,10 +133,12 @@ public class SeckillExecutor {
                     String.valueOf(userId), String.valueOf(qty),
                     reason == null ? "" : reason,
                     keepBought ? "1" : "0",
-                    String.valueOf(props.getSeckill().getResultTtl().toSeconds()));
+                    String.valueOf(props.getSeckill().getResultTtl().toSeconds()),
+                    String.valueOf(failStatus.code()));
             boolean done = Long.valueOf(0L).equals(r);
-            log.info("stage=STOCK_ROLLBACK requestNo={} userId={} qty={} keepBought={} done={} reason={}",
-                    requestNo, userId, qty, keepBought, done, reason);
+            log.info("stage=STOCK_ROLLBACK requestNo={} userId={} qty={} keepBought={} "
+                            + "failStatus={} done={} reason={}",
+                    requestNo, userId, qty, keepBought, failStatus, done, reason);
             return done;
         } catch (Exception e) {
             // 回补失败是库存泄漏（少卖），不是超卖。方向安全，但必须能被告警发现
@@ -213,6 +220,17 @@ public class SeckillExecutor {
     public Long currentStock(long activityId, long skuId) {
         String v = redis.opsForValue().get(RedisKeys.stock(activityId, skuId));
         return v == null ? null : Long.parseLong(v);
+    }
+
+    /**
+     * 该订单是否已经回补过。
+     *
+     * <p>消费端用它区分"脚本执行失败"与"幂等命中"：脚本 C 对两者都返回非 0，
+     * 分不开的话重复投递会被当成失败无限重试，最后整批进死信。
+     */
+    public boolean isReleased(long activityId, long skuId, String orderNo) {
+        return Boolean.TRUE.equals(redis.opsForSet()
+                .isMember(RedisKeys.released(activityId, skuId), orderNo));
     }
 
     /**

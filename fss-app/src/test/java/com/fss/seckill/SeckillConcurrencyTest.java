@@ -27,8 +27,13 @@ import static org.assertj.core.api.Assertions.fail;
  * 在这里就拦不住，后面加缓存只是把 bug 藏得更深。
  *
  * <p>阶段二起同一批断言的<b>拦截点变了</b>：库存不足与一人一单现在由 Lua 在 Redis
- * 里判掉，请求根本走不到 MySQL。断言本身一个字没改，这正是这批用例的价值：
- * 它们锁住的是"对外行为"，而不是某一层的实现。
+ * 里判掉，请求根本走不到 MySQL。阶段三又变了一次：接口返回"排队中"，订单由消费端建。
+ * 断言本身一个字没改，这正是这批用例的价值：它们锁住的是"对外行为"，
+ * 而不是某一层的实现。
+ *
+ * <p>唯一的加法是 {@code awaitOrders}：异步化之后"恰好 100 单"这件事需要等消费端
+ * 处理完才能断言。注意 {@code r.success} 仍然是准的——它统计的是"拿到资格的请求数"，
+ * 而资格分配从阶段二起就一直是 Lua 同步给出的。
  */
 class SeckillConcurrencyTest extends IntegrationTestBase {
 
@@ -56,6 +61,7 @@ class SeckillConcurrencyTest extends IntegrationTestBase {
                 .isEqualTo(concurrency - stock);
         assertThat(r.unexpected).as("不允许出现非业务异常").isEmpty();
 
+        fixture.awaitOrders(act.activityId(), act.skuId(), stock);
         assertThat(fixture.countOrders(act.activityId(), act.skuId())).isEqualTo(stock);
 
         TestFixture.StockSnapshot s = fixture.stock(act.activityId(), act.skuId());
@@ -79,6 +85,7 @@ class SeckillConcurrencyTest extends IntegrationTestBase {
         assertThat(r.count(ErrorCode.ALREADY_BOUGHT)).isEqualTo(49);
         assertThat(r.unexpected).isEmpty();
 
+        fixture.awaitOrders(act.activityId(), act.skuId(), 1);
         assertThat(fixture.countOrders(act.activityId(), act.skuId())).isEqualTo(1);
         TestFixture.StockSnapshot s = fixture.stock(act.activityId(), act.skuId());
         assertThat(s.available())
@@ -98,6 +105,7 @@ class SeckillConcurrencyTest extends IntegrationTestBase {
 
         assertThat(r.success.get()).isEqualTo(1);
         assertThat(r.unexpected).isEmpty();
+        fixture.awaitOrders(act.activityId(), act.skuId(), 1);
         assertThat(fixture.countOrders(act.activityId(), act.skuId())).isEqualTo(1);
 
         TestFixture.StockSnapshot s = fixture.stock(act.activityId(), act.skuId());
@@ -141,9 +149,8 @@ class SeckillConcurrencyTest extends IntegrationTestBase {
         long u1 = fixture.createUser();
         long u2 = fixture.createUser();
 
-        SeckillSubmitVO ok = submit(act, u1);
+        SeckillSubmitVO ok = fixture.submitAndAwait(act, u1);
         assertThat(ok.getOrderNo()).isNotBlank();
-
         try {
             submit(act, u2);
             fail("库存已耗尽，第二个用户应当失败");
@@ -186,6 +193,13 @@ class SeckillConcurrencyTest extends IntegrationTestBase {
     // 并发压测脚手架见 com.fss.test.Burst
     // ------------------------------------------------------------------
 
+    /**
+     * 并发用例用<b>裸的</b> submit，不等结论。
+     *
+     * <p>它统计的是"拿到资格的请求数"，而资格分配从阶段二起一直是 Lua 同步给出的：
+     * 库存不足、一人一单、时间窗口都在这一刻抛出。改成等结论反而会让 1 万个线程
+     * 各自去轮询结果接口，测出来的耗时全是轮询开销。
+     */
     private SeckillSubmitVO submit(TestFixture.Activity act, long userId) {
         return seckillService.submit(SeckillCmd.of(act.activityId(), act.skuId(), 1), userId);
     }

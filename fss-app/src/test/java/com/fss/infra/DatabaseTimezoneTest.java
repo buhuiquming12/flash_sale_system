@@ -60,8 +60,7 @@ class DatabaseTimezoneTest extends IntegrationTestBase {
     void 订单时间字段同源() {
         TestFixture.Activity act = fixture.createRunningActivity(10);
         long userId = fixture.createUser();
-        SeckillSubmitVO vo = seckillService.submit(
-                SeckillCmd.of(act.activityId(), act.skuId(), 1), userId);
+        SeckillSubmitVO vo = fixture.submitAndAwait(act, userId);
 
         OrderVO order = orderService.detail(vo.getOrderNo(), userId);
 
@@ -83,8 +82,7 @@ class DatabaseTimezoneTest extends IntegrationTestBase {
     void 取消时间同源() {
         TestFixture.Activity act = fixture.createRunningActivity(10);
         long userId = fixture.createUser();
-        SeckillSubmitVO vo = seckillService.submit(
-                SeckillCmd.of(act.activityId(), act.skuId(), 1), userId);
+        SeckillSubmitVO vo = fixture.submitAndAwait(act, userId);
 
         LocalDateTime before = LocalDateTime.now();
         orderService.cancel(vo.getOrderNo(), userId);
