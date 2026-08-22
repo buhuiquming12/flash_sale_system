@@ -7,6 +7,7 @@ import com.fss.biz.seckill.core.SeckillCompensateService;
 import com.fss.biz.seckill.core.SeckillExecutor;
 import com.fss.biz.seckill.core.SeckillOutcome;
 import com.fss.biz.seckill.core.SeckillTokenService;
+import com.fss.biz.seckill.core.UncertainRecorder;
 import com.fss.biz.seckill.model.SeckillCmd;
 import com.fss.biz.seckill.model.SeckillResultVO;
 import com.fss.biz.seckill.model.SeckillSubmitVO;
@@ -22,8 +23,10 @@ import com.fss.domain.entity.SeckillRequest;
 import com.fss.domain.mapper.OrderMapper;
 import com.fss.domain.mapper.SeckillRequestMapper;
 import com.fss.domain.message.OrderCreateMessage;
-import com.fss.infra.config.FssProperties;
+import com.fss.infra.alarm.AlarmService;
 import com.fss.infra.config.SentinelConfig;
+import com.fss.infra.degrade.DegradeSwitch;
+import com.fss.infra.metrics.SeckillMetrics;
 import com.fss.infra.mq.MqTopics;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -65,10 +68,13 @@ public class SeckillServiceImpl implements SeckillService {
     private final SeckillExecutor          executor;
     private final SeckillTokenService      tokenService;
     private final SeckillCompensateService compensateService;
+    private final UncertainRecorder        uncertainRecorder;
     private final ReliableMqProducer       producer;
     private final OrderMapper              orderMapper;
     private final SeckillRequestMapper     requestMapper;
-    private final FssProperties            props;
+    private final DegradeSwitch            degradeSwitch;
+    private final SeckillMetrics           metrics;
+    private final AlarmService             alarm;
 
     /**
      * {@code exceptionsToIgnore = BizException.class} 是这段集成里最关键的一行。
@@ -84,8 +90,9 @@ public class SeckillServiceImpl implements SeckillService {
             fallback = "onSubmitFallback",
             exceptionsToIgnore = BizException.class)
     public SeckillSubmitVO submit(SeckillCmd cmd, long userId) {
-        // 1. 降级开关。放在最前面：降级的目的就是不消耗后面的资源
-        if (!props.getDegrade().isSeckillEnabled()) {
+        // 1. 降级开关。放在最前面：降级的目的就是不消耗后面的资源。
+        //    读的是本地 volatile（每秒从 Redis 刷一次），这条最热的路径上零网络往返
+        if (!degradeSwitch.seckillEnabled()) {
             throw new BizException(ErrorCode.SERVICE_DEGRADED);
         }
         Assert.require(cmd.getActivityId() != null && cmd.getActivityId() > 0, "活动 ID 不合法");
@@ -117,10 +124,24 @@ public class SeckillServiceImpl implements SeckillService {
 
         // 3. Lua 原子判扣：活动校验、时间校验（Redis 时钟）、一人一单、库存预扣、
         //    写请求记录，五件事一次完成。这是整个系统唯一的资格分配入口
-        SeckillOutcome outcome = executor.trySeckill(
-                activityId, skuId, userId, quantity, requestNo, traceId);
+        SeckillOutcome outcome;
+        try {
+            outcome = executor.trySeckill(activityId, skuId, userId, quantity, requestNo, traceId);
+        } catch (SeckillExecutor.UncertainResultException e) {
+            // Redis 调用失败，无法确定脚本执行了没有。既不能放行也不能回补——
+            // 登记进待确认集合，由 UncertainCheckJob 事后用 EXISTS req key 判定。
+            // 对用户报"系统繁忙"让他重试：重试用的是新 requestNo，
+            // 即使这一条最终判定为"已扣"，一人一单的 bought 标记也会拦住第二次
+            boolean recorded = uncertainRecorder.record(msg);
+            metrics.seckillRequest(activityId, skuId, "uncertain");
+            alarm.p2(AlarmService.Event.REDIS_UNCERTAIN, requestNo,
+                    recorded ? "已登记待确认" : "登记失败，只能靠库存对账发现");
+            throw new BizException(ErrorCode.SYSTEM_BUSY, "系统繁忙，请稍后重试");
+        }
+
         if (!outcome.qualified()) {
             ErrorCode ec = outcome.errorCode();
+            metrics.seckillRequest(activityId, skuId, ec.name().toLowerCase());
             // Lua 在时间/库存校验阶段直接返回，没有创建 req key，
             // 这里补一条结论进去：客户端可能已经在轮询，给它明确答案比让它等超时好。
             //
@@ -142,17 +163,23 @@ public class SeckillServiceImpl implements SeckillService {
             log.error("stage=SECKILL_SUBMIT requestNo={} result=MQ_PERSIST_FAILED 立即回补",
                     requestNo, e);
             compensateService.rollback(msg, ErrorCode.SYSTEM_BUSY, "消息登记失败，已退回");
+            metrics.seckillRequest(activityId, skuId, "mq_persist_failed");
             throw new BizException(ErrorCode.SYSTEM_BUSY);
         }
 
+        metrics.seckillRequest(activityId, skuId, "qualified");
+        metrics.qualified(activityId, skuId);
         log.info("stage=SECKILL_SUBMIT requestNo={} userId={} activityId={} skuId={} "
                         + "result=QUEUEING remain={}",
                 requestNo, userId, activityId, skuId, outcome.remainStock());
         // 剩余库存报 Redis 的值而不是 DB 的：Redis 才是资格分配的权威，
         // 而且异步化之后 DB 的 available_stock 会滞后于真实可抢量，
-        // 两者的差值正是"排队中"的量
+        // 两者的差值正是"排队中"的量。
+        //
+        // pollAfterMs 由降级开关下发：Level 2 起从 300ms 拉到 2000ms，
+        // 把结果接口的压力降一个数量级，而且不用发版
         return SeckillSubmitVO.queueing(requestNo, (int) outcome.remainStock(),
-                props.getDegrade().getPollIntervalMs());
+                degradeSwitch.pollIntervalMs());
     }
 
     /** Sentinel 限流/熔断触发。签名 = 原方法 + BlockException */

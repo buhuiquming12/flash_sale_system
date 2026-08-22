@@ -1,0 +1,162 @@
+# 告警规则。对应 docs/07 §7。
+#
+# 分级的含义是"要不要现在叫人"：
+#   P1 = 不变量被违反或有资损风险，立刻通知（生产接短信/电话）
+#   P2 = 需要人看但不必立刻，工作时间处理
+#
+# `for:` 的取值有讲究：
+#   for: 0m  用于"发生即异常"的不变量违反 —— 库存为负、Redis > DB、支付差异。
+#            这些东西不存在"观察一下会不会自己好"，出现一次就是一次事故。
+#   for: 2m  用于比率与容量类指标 —— 它们会短暂尖刺（一次 GC、一批冷启动请求），
+#            立刻告警就是在制造噪音，而噪音会让人开始忽略告警。
+groups:
+  # ==================================================================
+  - name: fss-critical
+    rules:
+      # 库存为负是最严重的不变量违反：Lua 的 DECRBY 在库存不足时本该被
+      # `stock < qty` 挡住，出现负数说明那个判断被绕过了
+      - alert: RedisStockNegative
+        expr: fss_stock_remain < 0
+        for: 0m
+        labels: { severity: P1 }
+        annotations:
+          summary: "Redis 库存为负，存在超卖"
+          description: "activity={{ $labels.activity }} sku={{ $labels.sku }} 值={{ $value }}"
+
+      # Redis 先扣、DB 后扣，所以 Redis 必须 <= DB。大于意味着 Redis 里有一份
+      # DB 不知道的可售库存，它会被分配出去。最常见成因是活动进行中
+      # Redis key 过期后被重新预热（setIfAbsent 用 DB 值初始化，
+      # 而那时还有 queueing 份已预扣未落库的量）
+      #
+      # for: 1m 而不是 0m：对账任务与抓取之间有时序差，两个仪表可能来自
+      # 相邻两轮对账。给一分钟避开这种伪差异
+      - alert: RedisStockGreaterThanDb
+        expr: fss_stock_remain > fss_stock_db_available
+        for: 1m
+        labels: { severity: P1 }
+        annotations:
+          summary: "Redis 库存大于 DB，库存视图错乱"
+          description: "activity={{ $labels.activity }} sku={{ $labels.sku }}"
+
+      - alert: OrderExceedsTotalStock
+        expr: |
+          sum by (activity, sku) (fss_order_create_total)
+            > on (activity, sku) fss_stock_capacity
+        for: 0m
+        labels: { severity: P1 }
+        annotations:
+          summary: "订单数超过总库存，已超卖"
+
+      # 支付对账差异一律 P1：它意味着资金与业务不一致
+      - alert: PaymentReconcileDiff
+        expr: increase(fss_reconcile_diff_total{type="payment"}[10m]) > 0
+        for: 0m
+        labels: { severity: P1 }
+        annotations:
+          summary: "支付对账出现差异，可能资损"
+
+      # 应用侧发出的 P1 告警。这条规则是"告警的告警"：
+      # 日志管道本身也会挂，而指标是独立的一条路
+      - alert: ApplicationP1Alarm
+        expr: increase(fss_alarm_total{severity="P1"}[5m]) > 0
+        for: 0m
+        labels: { severity: P1 }
+        annotations:
+          summary: "应用发出 P1 告警: {{ $labels.event }}"
+
+      - alert: AppDown
+        expr: up{job="fss-app"} == 0
+        for: 1m
+        labels: { severity: P1 }
+        annotations:
+          summary: "实例不可达 {{ $labels.instance }}"
+
+  # ==================================================================
+  - name: fss-warning
+    rules:
+      - alert: MqBacklogHigh
+        expr: fss_mq_backlog{topic="FSS_ORDER_CREATE"} > 20000
+        for: 2m
+        labels: { severity: P2 }
+        annotations:
+          summary: "订单创建消息积压 {{ $value }}"
+          description: "自动降级阈值是 50000，这条是提前预警"
+
+      # 分子只算 result="error" 与 uncertain 这两种<b>系统</b>失败。
+      # 绝不能把 stock_not_enough / already_bought 算进去：活动一售罄
+      # 失败率就是 99%，而那是完全正常的业务结果。
+      # 这个区分在应用侧已经做过一次（Sentinel 的 exceptionsToIgnore），
+      # 这里是同一个道理的第二次体现
+      - alert: SeckillErrorRateHigh
+        expr: |
+          sum(rate(fss_seckill_request_total{result=~"error|uncertain|mq_persist_failed"}[1m]))
+          / clamp_min(sum(rate(fss_seckill_request_total[1m])), 0.001) > 0.05
+        for: 2m
+        labels: { severity: P2 }
+        annotations:
+          summary: "秒杀系统错误率 {{ $value | humanizePercentage }}"
+
+      # Lua 是唯一的串行瓶颈，它的 P99 直接决定接口 P99
+      - alert: LuaSlow
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, script) (rate(fss_lua_execution_seconds_bucket[5m]))) > 0.005
+        for: 2m
+        labels: { severity: P2 }
+        annotations:
+          summary: "Lua 脚本 P99 超 5ms: {{ $labels.script }}"
+          description: "先查 bought Hash 是否膨胀，以及代码里有没有 HGETALL"
+
+      - alert: HikariPoolExhausted
+        expr: hikaricp_connections_pending > 5
+        for: 1m
+        labels: { severity: P2 }
+        annotations:
+          summary: "连接池有 {{ $value }} 个线程在等连接"
+          description: "检查 consumeThreadNumber 是否与池大小对齐（见 docs/05 §7）"
+
+      - alert: LongQueueingRequests
+        expr: fss_stock_queueing > 500
+        for: 5m
+        labels: { severity: P2 }
+        annotations:
+          summary: "大量请求长期排队，消费端可能卡住"
+
+      - alert: DlqNotEmpty
+        expr: increase(fss_dlq_total[5m]) > 0
+        for: 0m
+        labels: { severity: P2 }
+        annotations:
+          summary: "有消息进入死信队列 topic={{ $labels.topic }}"
+
+      - alert: MqGiveUp
+        expr: increase(fss_mq_give_up_total[10m]) > 0
+        for: 0m
+        labels: { severity: P2 }
+        annotations:
+          summary: "消息投递被放弃 topic={{ $labels.topic }}"
+          description: "订单创建消息会自动回补，其余 Topic 需人工确认"
+
+      # 对账是"上面全都失效时"的最后一道防线，而防线自己失效是无声的：
+      # 没有差异被记录，看板上一片正常。这条规则专门盯它
+      - alert: ReconcileJobFailing
+        expr: increase(fss_job_error_total{job=~"reconcile.*"}[15m]) >= 3
+        for: 0m
+        labels: { severity: P2 }
+        annotations:
+          summary: "对账任务连续失败 job={{ $labels.job }}"
+
+      # 降级不该长期挂着。人工降级没有 TTL，靠这条规则提醒有人忘了解除
+      - alert: DegradeActive
+        expr: fss_degrade_level > 0
+        for: 10m
+        labels: { severity: P2 }
+        annotations:
+          summary: "降级已持续 10 分钟，当前 Level {{ $value }}"
+
+      - alert: RedisUncertainHigh
+        expr: increase(fss_redis_uncertain_total[5m]) > 10
+        for: 0m
+        labels: { severity: P2 }
+        annotations:
+          summary: "Redis 调用结果不确定 {{ $value }} 次，Redis 在超时边缘"

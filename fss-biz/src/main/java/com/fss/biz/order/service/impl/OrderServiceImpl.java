@@ -13,6 +13,7 @@ import com.fss.domain.entity.Order;
 import com.fss.domain.entity.OrderItem;
 import com.fss.domain.mapper.OrderItemMapper;
 import com.fss.domain.mapper.OrderMapper;
+import com.fss.infra.metrics.SeckillMetrics;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -32,6 +33,7 @@ public class OrderServiceImpl implements OrderService {
     private final OrderMapper         orderMapper;
     private final OrderItemMapper     orderItemMapper;
     private final StockReleaseService stockReleaseService;
+    private final SeckillMetrics      metrics;
 
     @Override
     public PageR<OrderVO> listMyOrders(long userId, Integer status, long page, long size) {
@@ -110,7 +112,32 @@ public class OrderServiceImpl implements OrderService {
 
         // 阶段一直接同步回补；阶段三改为发 STOCK_RELEASE 消息（提交后投递）
         stockReleaseService.release(orderNo, reason);
+
+        Order o = orderMapper.selectByOrderNo(orderNo);
+        if (o != null) {
+            metrics.orderCancelled(o.getActivityId(), o.getSkuId(), cancelReasonTag(reason));
+        }
         return true;
+    }
+
+    /**
+     * 取消原因归成三档。
+     *
+     * <p>指标标签不能直接用 {@code reason} 原文：它是自由文本（"超时未支付(扫描)"、
+     * "超时未支付(定时消息)"、"消息进入死信队列，已自动回补"…），每种措辞都会
+     * 变成一条新的时间序列。归档之后 Grafana 里"取消原因分布"这张图才有意义。
+     */
+    private static String cancelReasonTag(String reason) {
+        if (reason == null) {
+            return "system";
+        }
+        if (reason.contains("超时")) {
+            return "timeout";
+        }
+        if (reason.contains("用户")) {
+            return "user";
+        }
+        return "system";
     }
 
     private OrderVO toVO(Order o, List<OrderItem> items) {

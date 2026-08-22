@@ -15,15 +15,16 @@ import java.time.Duration;
 @ConfigurationProperties(prefix = "fss")
 public class FssProperties {
 
-    private Order     order     = new Order();
-    private Seckill   seckill   = new Seckill();
-    private RateLimit ratelimit = new RateLimit();
-    private Mq        mq        = new Mq();
-    private Degrade   degrade   = new Degrade();
-    private Jwt       jwt       = new Jwt();
-    private Pay       pay       = new Pay();
-    private Job       job       = new Job();
-    private Sentinel  sentinel  = new Sentinel();
+    private Order      order      = new Order();
+    private Seckill    seckill    = new Seckill();
+    private RateLimit  ratelimit  = new RateLimit();
+    private Mq         mq         = new Mq();
+    private Degrade    degrade    = new Degrade();
+    private Jwt        jwt        = new Jwt();
+    private Pay        pay        = new Pay();
+    private Job        job        = new Job();
+    private Sentinel   sentinel   = new Sentinel();
+    private Reconcile  reconcile  = new Reconcile();
 
     @Data
     public static class Order {
@@ -96,6 +97,15 @@ public class FssProperties {
         private Group group       = new Group();
         private long  sendTimeout = 2000;
         private int   maxResend   = 5;
+        /**
+         * 是否启动 {@code DefaultMQAdminExt} 采集积压量。
+         *
+         * <p>默认关：它是一个额外的 MQ 客户端，broker 不可达时会每轮刷一条连接失败日志，
+         * 把真正的错误埋掉；而集成测试里多一个客户端在 Windows 上会直接撞
+         * {@code GetAdaptersAddresses failed with error == 1450}。
+         * 联调与生产显式打开。
+         */
+        private boolean backlogMonitorEnabled = false;
 
         @Data
         public static class Topic {
@@ -116,19 +126,51 @@ public class FssProperties {
 
     @Data
     public static class Degrade {
-        /** 总开关，可运行时关闭秒杀入口 */
+        /**
+         * 人工总闸。与自动降级是<b>与</b>关系：关掉之后自动逻辑恢复到 Level 0
+         * 也不能把秒杀打开——自动机制只允许收紧，不允许放开人的决定。
+         */
         private boolean seckillEnabled   = true;
-        private long    backlogThreshold = 50_000;
+        /** 本地缓存刷新间隔（毫秒）。开关最多延迟这么久生效 */
+        private long    refreshDelayMs   = 1000;
+        /**
+         * {@code degrade:level} 的 TTL（秒）。
+         *
+         * <p>必须有：写入 Level 3 的那个 job 实例随后崩溃时，没有 TTL 的话这个 key
+         * 永久停在 3，秒杀再也不会自动恢复，而没有任何机制负责删它。
+         * 取值要明显大于监控任务的间隔（否则正常运行时开关会自己过期抖动），
+         * 默认 15s 间隔 → 300s TTL 有 20 倍余量。
+         */
+        private long    levelTtlSeconds  = 300;
         /**
          * 下发给客户端的轮询间隔（毫秒）。
          *
          * <p>这是一个<b>软限流手段</b>：异步化之后每个用户提交完都要轮询结果，
          * 1 万个用户按 300ms 轮询就是 33000 QPS 打在结果接口上，
          * 比秒杀提交本身还高。服务端下发间隔，客户端照着等，
-         * 比在客户端硬编码好——降级时（docs/07 Level 2）可以直接拉长到 2000ms，
-         * 不用发版。
+         * 比在客户端硬编码好——降级时可以直接拉长，不用发版。
          */
         private int     pollIntervalMs   = 300;
+        /** Level 2 起下发的轮询间隔。拉长 6~7 倍，结果接口压力降一个数量级 */
+        private int     degradedPollIntervalMs = 2000;
+
+        // ---- 自动降级的触发与恢复阈值 ----
+
+        /** 是否启用自动降级。关掉之后只能人工调 {@code degrade:level} */
+        private boolean autoEnabled      = true;
+        /** 消息积压超过它 → Level 3（暂停新资格分配） */
+        private long    backlogThreshold = 50_000;
+        /** 消费端 TPS 跌至 0 且积压 > 0 持续这么多轮 → Level 3 */
+        private int     stalledRounds    = 4;
+        /** Hikari 连接池等待数超过它 → Level 2 */
+        private int     dbPendingThreshold = 5;
+        /**
+         * 恢复阈值 = 触发阈值 × 这个比例（滞回）。
+         *
+         * <p>必须小于 1：等于 1 就会在阈值附近反复开关（积压 50001 降级 → 消费追上
+         * 变 49999 恢复 → 流量立刻回来又 50001），每次抖动都是一次全站行为变化。
+         */
+        private double  recoverRatio     = 0.5;
     }
 
     @Data
@@ -167,6 +209,52 @@ public class FssProperties {
          * 两轮会重叠——虽然分布式锁挡得住，但那是靠锁掩盖了配置问题。
          */
         private long   mqResendDelayMs   = 30_000;
+        /** 资格对账 */
+        private String reconcileQualificationCron = "0 * * * * ?";
+        /** 库存对账 */
+        private String reconcileStockCron         = "0 */5 * * * ?";
+        /** 支付对账 */
+        private String reconcilePaymentCron       = "0 */10 * * * ?";
+        /** 不确定结果确认。间隔用 fixedDelay，语义是"上一轮处理完再等这么久" */
+        private long   uncertainCheckDelayMs      = 10_000;
+        /** 降级监控。间隔要明显小于 {@code degrade.level-ttl-seconds} */
+        private long   degradeMonitorDelayMs      = 15_000;
+    }
+
+    /**
+     * 对账任务参数。
+     *
+     * <p>这些"等多久才认为是差异"的值全都是取舍：给短了会把正常的异步延迟当成差异
+     * （每分钟刷一堆假差异，真差异被淹没），给长了差异发现得晚（库存被多占几分钟）。
+     */
+    @Data
+    public static class Reconcile {
+        /**
+         * 排队中请求超过这么久还没结论，才算孤儿。
+         *
+         * <p>下限是"消息重发耗尽的总时长"：重发退避是 30+60+120+240+480 ≈ 15.5 分钟，
+         * 在那之前重发任务还在努力，对账插手只会重复回补。取 5 分钟是折中——
+         * 5 分钟没结论的请求，用户早就走了，占着的库存比"等重发任务再试两轮"更值钱；
+         * 而对账不会直接回补，它先看消息表状态（见 {@code QualificationReconciler}）。
+         */
+        private Duration orphanAfter        = Duration.ofMinutes(5);
+        /** 同一个孤儿请求连续这么多轮仍无结论 → 直接回补，不再等重发 */
+        private int      orphanRoundsBeforeRollback = 3;
+        /** 支付流水完成后多久仍与订单状态不符，才算差异 */
+        private Duration paymentDiffAfter   = Duration.ofMinutes(5);
+        /** 单轮扫描的上限，防止一轮跑太久拖过分布式锁租期 */
+        private int      batchSize          = 500;
+        /** 不确定记录保留多久。超期仍无法判定 → 落对账任务转人工 */
+        private Duration uncertainRetention = Duration.ofMinutes(10);
+        /**
+         * 不确定记录在这么久之后才开始判定。
+         *
+         * <p>不能立刻判：Redis 超时的那一刻，脚本可能<b>正在</b>执行。
+         * 马上 {@code EXISTS req key} 读到不存在就断定"没执行"，
+         * 而 50ms 后它执行完了——于是库存被扣掉却没人补消息，
+         * 成了一个只有库存对账才能发现的泄漏。
+         */
+        private Duration uncertainSettle    = Duration.ofSeconds(5);
     }
 
     /**

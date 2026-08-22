@@ -52,11 +52,38 @@ fss:
     close-expired-cron: "0 0 0 1 1 ?"
     activity-state-cron: "0 0 0 1 1 ?"
     warmup-cron: "0 0 0 1 1 ?"
+    reconcile-qualification-cron: "0 0 0 1 1 ?"
+    reconcile-stock-cron: "0 0 0 1 1 ?"
+    reconcile-payment-cron: "0 0 0 1 1 ?"
     # 重发任务用 fixedDelay，没有 cron 可关，设成一天
     mq-resend-delay-ms: 86400000
+    uncertain-check-delay-ms: 86400000
+    degrade-monitor-delay-ms: 86400000
   mq:
     # 调小重发上限：测"耗尽后回补"时不用等 5 轮
     max-resend: 2
+    # 必须关：DefaultMQAdminExt 是第三个 MQ 客户端，而每次实例化都要枚举网卡。
+    # Windows 上 Docker Desktop 的虚拟网卡本来就多，多一个客户端就可能撞
+    # java.lang.Error: IP Helper Library GetAdaptersAddresses failed with error == 1450
+    backlog-monitor-enabled: false
+  degrade:
+    # 关掉每秒刷新：测试要精确控制 level 何时生效，后台线程会在断言中间把它改掉。
+    # 用例显式调 degradeSwitch.refresh() 代替
+    refresh-delay-ms: 86400000
+    # 自动降级值的 TTL 设长：测试里 setAutoLevel 之后不希望它中途过期
+    level-ttl-seconds: 3600
+    auto-enabled: true
+  reconcile:
+    # 测试造的数据都是"刚刚"发生的，等 5 分钟没意义。设成 0 让用例造完就能对账。
+    #
+    # 这不是"为了测试放宽生产规则"——orphan-after 的语义是"给异步链路留多久"，
+    # 而测试里用例自己控制了消费端有没有处理过，不需要这个缓冲
+    orphan-after: 0s
+    payment-diff-after: 0s
+    uncertain-settle: 0s
+    uncertain-retention: 10m
+    orphan-rounds-before-rollback: 2
+    batch-size: 500
   sentinel:
     # 必须关掉。并发用例会在几秒内打上万次 submit，撞上 QPS 阈值后
     # 失败原因变成 RATE_LIMITED，"是否超卖"的断言就被污染成"限流是否生效"了。

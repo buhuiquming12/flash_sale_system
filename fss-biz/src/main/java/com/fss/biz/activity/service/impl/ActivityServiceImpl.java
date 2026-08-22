@@ -26,6 +26,7 @@ import com.fss.domain.mapper.SeckillActivityMapper;
 import com.fss.domain.mapper.SeckillGoodsMapper;
 import com.fss.domain.mapper.StockLogMapper;
 import com.fss.infra.cache.LogicalExpiryCache;
+import com.fss.infra.degrade.DegradeSwitch;
 import com.fss.infra.redis.RedisKeys;
 import com.fss.infra.tx.TxSupport;
 import lombok.RequiredArgsConstructor;
@@ -52,6 +53,7 @@ public class ActivityServiceImpl implements ActivityService {
     private final ProductService        productService;
     private final AdminAuditService     audit;
     private final LogicalExpiryCache    cache;
+    private final DegradeSwitch         degradeSwitch;
     private final StringRedisTemplate   redis;
 
     @Override
@@ -252,6 +254,10 @@ public class ActivityServiceImpl implements ActivityService {
     public ActivityDetailVO detail(long activityId) {
         // 参数校验是防穿透的第一道：ID 非正数的请求连缓存都不必查
         Assert.require(activityId > 0, ErrorCode.ACTIVITY_NOT_FOUND);
+        // Level 4：只保留订单查询与支付。商品浏览是优先级最低的那一档
+        if (!degradeSwitch.browseEnabled()) {
+            throw new BizException(ErrorCode.SERVICE_DEGRADED);
+        }
 
         ActivityDetailVO cached = cache.get(RedisKeys.activityDetail(activityId),
                 ActivityDetailVO.class, () -> loadDetailFromDb(activityId));
@@ -341,13 +347,27 @@ public class ActivityServiceImpl implements ActivityService {
             vo.setStatusDesc(derived.getDesc());
         }
 
+        // Level 1 起不再展示精确库存。这一档降级省掉的正是下面这个 per-SKU 的
+        // Redis 读——一个活动 10 个 SKU 就是 10 次往返，而详情接口是全站 QPS 最高的
+        boolean exact = degradeSwitch.showExactStock();
         if (vo.getGoodsList() != null) {
             for (ActivityDetailVO.GoodsItemVO item : vo.getGoodsList()) {
+                if (!exact) {
+                    // 只保留"有货/无货"这一个比特。用缓存里的 DB 快照判断——
+                    // 它可能滞后，但降级期间"大概还有货"这个精度足够
+                    item.setStockLevel(item.getRemainStock() != null && item.getRemainStock() > 0
+                            ? ActivityDetailVO.StockLevel.AVAILABLE
+                            : ActivityDetailVO.StockLevel.SOLD_OUT);
+                    item.setRemainStock(null);
+                    continue;
+                }
                 Long redisStock = redisStock(vo.getActivityId(), item.getSkuId());
                 if (redisStock != null) {
                     item.setRemainStock((int) Math.max(0, redisStock));
                 }
                 item.setSoldOut(item.getRemainStock() != null && item.getRemainStock() <= 0);
+                item.setStockLevel(ActivityDetailVO.StockLevel.of(
+                        item.getRemainStock(), item.getTotalStock()));
             }
         }
         return vo;

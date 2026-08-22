@@ -1,0 +1,15 @@
+apiVersion: 1
+
+providers:
+  - name: fss
+    orgId: 1
+    folder: 秒杀系统
+    type: file
+    # 允许在 UI 里改动后保存回文件。默认 false 时改了刷新就没了，
+    # 而演示前临时调一张图是常见需求
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

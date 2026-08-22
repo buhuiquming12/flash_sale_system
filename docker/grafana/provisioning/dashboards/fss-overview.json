@@ -1,0 +1,260 @@
+{
+  "uid": "fss-seckill",
+  "title": "秒杀系统总览",
+  "tags": ["fss", "seckill"],
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "editable": true,
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "activity",
+        "label": "活动",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(fss_stock_capacity, activity)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "一眼看健康",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "降级等级",
+      "description": "人工降级没有 TTL，必须有人显式解除。这个数字长期非 0 就是有人忘了解除。",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "targets": [{ "expr": "fss_degrade_level", "legendFormat": "level" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "orange", "value": 2 },
+              { "color": "red", "value": 3 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "资格分配 TPS",
+      "gridPos": { "h": 4, "w": 5, "x": 4, "y": 1 },
+      "targets": [{
+        "expr": "sum(rate(fss_seckill_qualified_total[1m]))",
+        "legendFormat": "qualified/s"
+      }]
+    },
+    {
+      "type": "stat",
+      "title": "落库 TPS",
+      "description": "与资格分配 TPS 的差值 = 消费端跟不上的程度",
+      "gridPos": { "h": 4, "w": 5, "x": 9, "y": 1 },
+      "targets": [{
+        "expr": "sum(rate(fss_order_create_total[1m]))",
+        "legendFormat": "created/s"
+      }]
+    },
+    {
+      "type": "stat",
+      "title": "订单创建消息积压",
+      "gridPos": { "h": 4, "w": 5, "x": 14, "y": 1 },
+      "targets": [{
+        "expr": "fss_mq_backlog{topic=\"FSS_ORDER_CREATE\"}",
+        "legendFormat": "{{group}}"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 20000 },
+              { "color": "red", "value": 50000 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "未关闭对账差异",
+      "gridPos": { "h": 4, "w": 5, "x": 19, "y": 1 },
+      "targets": [{
+        "expr": "sum by (type) (increase(fss_reconcile_diff_total{action=\"need_manual\"}[1h]))",
+        "legendFormat": "{{type}}"
+      }]
+    },
+    {
+      "type": "row",
+      "title": "库存三视图（这张图是本看板的核心）",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis 剩余 / DB 可售 / 排队中",
+      "description": "三条线画在一起：Redis 与 DB 的差值就是排队中的量，差值持续扩大意味着消费端跟不上，一眼可见。Redis 线跑到 DB 线上面则一定是 bug（Redis 先扣、DB 后扣），对应 P1 告警 RedisStockGreaterThanDb。",
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "fss_stock_remain{activity=~\"$activity\"}",
+          "legendFormat": "Redis 剩余 a{{activity}}/s{{sku}}"
+        },
+        {
+          "expr": "fss_stock_db_available{activity=~\"$activity\"}",
+          "legendFormat": "DB 可售 a{{activity}}/s{{sku}}"
+        },
+        {
+          "expr": "fss_stock_queueing{activity=~\"$activity\"}",
+          "legendFormat": "排队中 a{{activity}}/s{{sku}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "lineWidth": 2, "fillOpacity": 5 },
+          "min": 0
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "秒杀结果分布",
+      "description": "用 result 标签而不是独立指标名，所以这里可以任意聚合。stock_not_enough 与 already_bought 是正常业务结果，不该进错误率。",
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 6 },
+      "targets": [{
+        "expr": "sum by (result) (rate(fss_seckill_request_total[1m]))",
+        "legendFormat": "{{result}}"
+      }],
+      "options": { "legend": { "displayMode": "table", "placement": "right" } }
+    },
+    {
+      "type": "row",
+      "title": "链路耗时",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Lua 脚本耗时 P50 / P95 / P99",
+      "description": "Lua 是整个系统唯一的串行瓶颈（Redis 单线程执行脚本），它的 P99 直接决定秒杀接口的 P99。接口变慢时这条曲线能立刻回答「是 Redis 慢了还是应用侧慢了」。",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, script) (rate(fss_lua_execution_seconds_bucket[5m])))",
+          "legendFormat": "P50 {{script}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, script) (rate(fss_lua_execution_seconds_bucket[5m])))",
+          "legendFormat": "P95 {{script}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, script) (rate(fss_lua_execution_seconds_bucket[5m])))",
+          "legendFormat": "P99 {{script}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP 接口 P99",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [{
+        "expr": "histogram_quantile(0.99, sum by (le, uri) (rate(http_server_requests_seconds_bucket{uri=~\"/api/seckill.*\"}[5m])))",
+        "legendFormat": "{{uri}}"
+      }],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "type": "row",
+      "title": "可靠性机制",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 }
+    },
+    {
+      "type": "timeseries",
+      "title": "消息重发 / 放弃 / 死信",
+      "description": "重发是正常的自愈；放弃与死信各自对应一条不同的兜底路径（onSendGiveUp 与 DlqListener），两者都必须能被看到。",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 25 },
+      "targets": [
+        { "expr": "sum by (topic) (increase(fss_mq_resend_total[5m]))", "legendFormat": "重发 {{topic}}" },
+        { "expr": "sum by (topic) (increase(fss_mq_give_up_total[5m]))", "legendFormat": "放弃 {{topic}}" },
+        { "expr": "sum by (topic) (increase(fss_dlq_total[5m]))", "legendFormat": "死信 {{topic}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "库存回补",
+      "description": "release = 取消回补（保留资格），compensate = 补偿回补（归还资格）。两种语义的量级差别很大：release 是正常的用户取消，compensate 抬头说明落库在失败。",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 25 },
+      "targets": [{
+        "expr": "sum by (type) (increase(fss_stock_rollback_total[5m]))",
+        "legendFormat": "{{type}}"
+      }]
+    },
+    {
+      "type": "timeseries",
+      "title": "告警与不确定结果",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 25 },
+      "targets": [
+        {
+          "expr": "sum by (severity, event) (increase(fss_alarm_total[5m]))",
+          "legendFormat": "{{severity}} {{event}}"
+        },
+        {
+          "expr": "sum by (stage) (increase(fss_redis_uncertain_total[5m]))",
+          "legendFormat": "uncertain {{stage}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "基础设施",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Hikari 连接池",
+      "description": "pending > 0 就说明消费线程数与池大小没对齐，症状是消费 TPS 上不去但 CPU 很闲（docs/05 §7）。",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 34 },
+      "targets": [
+        { "expr": "hikaricp_connections_active", "legendFormat": "active" },
+        { "expr": "hikaricp_connections_pending", "legendFormat": "pending" },
+        { "expr": "hikaricp_connections_idle", "legendFormat": "idle" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "JVM 堆与 GC 暂停",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 34 },
+      "targets": [
+        {
+          "expr": "sum(jvm_memory_used_bytes{area=\"heap\"})",
+          "legendFormat": "heap used"
+        },
+        {
+          "expr": "sum(rate(jvm_gc_pause_seconds_sum[1m])) / clamp_min(sum(rate(jvm_gc_pause_seconds_count[1m])), 0.001)",
+          "legendFormat": "平均暂停"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "定时任务失败",
+      "description": "对账是最后一道防线，而防线自己失效是无声的——没有差异被记录，看板一片正常。这张图专门盯它。",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 34 },
+      "targets": [{
+        "expr": "sum by (job) (increase(fss_job_error_total[15m]))",
+        "legendFormat": "{{job}}"
+      }]
+    }
+  ]
+}

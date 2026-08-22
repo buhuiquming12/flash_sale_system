@@ -5,6 +5,7 @@ import com.fss.common.error.BizException;
 import com.fss.common.error.ErrorCode;
 import com.fss.infra.config.FssProperties;
 import com.fss.infra.config.SentinelConfig;
+import com.fss.infra.metrics.SeckillMetrics;
 import com.fss.infra.redis.RedisKeys;
 import com.alibaba.csp.sentinel.annotation.SentinelResource;
 import com.alibaba.csp.sentinel.slots.block.BlockException;
@@ -29,6 +30,11 @@ import java.util.Map;
  * 库存差额由阶段四的库存对账任务收敛（Redis 少扣或多扣都能查出来）。
  * 完整的 {@code checkUncertain}（记录不确定请求、事后按 requestNo 反查 Redis
  * 确认是否已扣）留在阶段四，因为它需要 {@code t_reconcile_task} 真正跑起来。
+ * <p>阶段四补上了完整的不确定结果处理：{@link #trySeckill} 遇到 Redis 异常时抛
+ * {@link UncertainResultException}，调用方把这条请求登记进
+ * {@link UncertainRecorder}，由 {@code UncertainCheckJob} 事后用
+ * {@link #requestExists} 判定真实结果——脚本 A 的原子性保证
+ * <b>{@code req key} 存在 ⟺ 库存已扣</b>，这条等价关系就是判据。
  */
 @Slf4j
 @Component
@@ -41,6 +47,7 @@ public class SeckillExecutor {
     private final RedisScript<Long>   releaseScript;
     private final RedisScript<Long>   writeResultScript;
     private final FssProperties       props;
+    private final SeckillMetrics      metrics;
 
     @SuppressWarnings("rawtypes")
     public SeckillExecutor(StringRedisTemplate redis,
@@ -48,13 +55,15 @@ public class SeckillExecutor {
                            @Qualifier("rollbackScript") RedisScript<Long> rollbackScript,
                            @Qualifier("releaseScript") RedisScript<Long> releaseScript,
                            @Qualifier("writeResultScript") RedisScript<Long> writeResultScript,
-                           FssProperties props) {
+                           FssProperties props,
+                           SeckillMetrics metrics) {
         this.redis = redis;
         this.seckillScript = seckillScript;
         this.rollbackScript = rollbackScript;
         this.releaseScript = releaseScript;
         this.writeResultScript = writeResultScript;
         this.props = props;
+        this.metrics = metrics;
     }
 
     /**
@@ -62,13 +71,15 @@ public class SeckillExecutor {
      *
      * <p>用并发线程数限流保护 Redis：Redis 变慢时线程堆积在等响应上，
      * 阈值一到就快速失败，而不是让 Tomcat 线程池被拖死。
+     *
+     * @throws UncertainResultException Redis 调用失败，<b>无法确定脚本是否已执行</b>
      */
     @SentinelResource(value = SentinelConfig.RES_SECKILL_SCRIPT,
             blockHandler = "onScriptBlocked",
             blockHandlerClass = SeckillExecutor.class)
     public SeckillOutcome trySeckill(long activityId, long skuId, long userId,
                                      int qty, String requestNo, String traceId) {
-        long t0 = System.currentTimeMillis();
+        long t0 = System.nanoTime();
         List<String> keys = List.of(
                 RedisKeys.goods(activityId, skuId),
                 RedisKeys.stock(activityId, skuId),
@@ -82,11 +93,15 @@ public class SeckillExecutor {
                     traceId == null ? "" : traceId,
                     String.valueOf(props.getSeckill().getResultTtl().toSeconds()));
         } catch (Exception e) {
-            // 关键：这里既不能放行也不能简单判失败——脚本可能已经扣了库存
+            // 关键：这里既不能放行也不能简单判失败——脚本可能已经扣了库存。
+            // 抛专用异常让调用方把它登记进"待确认"，由定时任务事后判定
+            metrics.redisUncertain("seckill");
             log.error("stage=SECKILL_LUA_UNCERTAIN requestNo={} userId={} activityId={} skuId={} "
-                            + "cost={}ms 无法确定脚本是否已执行，交由库存对账收敛",
-                    requestNo, userId, activityId, skuId, System.currentTimeMillis() - t0, e);
-            throw new BizException(ErrorCode.SYSTEM_BUSY, "系统繁忙，请稍后重试");
+                            + "cost={}ms 无法确定脚本是否已执行，登记待确认",
+                    requestNo, userId, activityId, skuId, millis(t0), e);
+            throw new UncertainResultException(requestNo, e);
+        } finally {
+            metrics.luaTimer("seckill", System.nanoTime() - t0);
         }
         if (raw == null || raw.isEmpty()) {
             log.error("stage=SECKILL_LUA requestNo={} result=EMPTY 脚本返回空", requestNo);
@@ -96,7 +111,7 @@ public class SeckillExecutor {
         int  code   = ((Number) raw.get(0)).intValue();
         long remain = raw.size() > 1 && raw.get(1) != null ? ((Number) raw.get(1)).longValue() : 0L;
         log.info("stage=SECKILL_LUA requestNo={} userId={} activityId={} skuId={} code={} remain={} cost={}ms",
-                requestNo, userId, activityId, skuId, code, remain, System.currentTimeMillis() - t0);
+                requestNo, userId, activityId, skuId, code, remain, millis(t0));
         return new SeckillOutcome(code, remain);
     }
 
@@ -128,6 +143,7 @@ public class SeckillExecutor {
                 RedisKeys.bought(activityId, skuId),
                 RedisKeys.request(activityId, skuId, requestNo),
                 RedisKeys.goods(activityId, skuId));
+        long t0 = System.nanoTime();
         try {
             Long r = redis.execute(rollbackScript, keys,
                     String.valueOf(userId), String.valueOf(qty),
@@ -136,15 +152,21 @@ public class SeckillExecutor {
                     String.valueOf(props.getSeckill().getResultTtl().toSeconds()),
                     String.valueOf(failStatus.code()));
             boolean done = Long.valueOf(0L).equals(r);
+            if (done) {
+                metrics.stockRollback(activityId, skuId, "compensate");
+            }
             log.info("stage=STOCK_ROLLBACK requestNo={} userId={} qty={} keepBought={} "
                             + "failStatus={} done={} reason={}",
                     requestNo, userId, qty, keepBought, failStatus, done, reason);
             return done;
         } catch (Exception e) {
             // 回补失败是库存泄漏（少卖），不是超卖。方向安全，但必须能被告警发现
+            metrics.redisUncertain("rollback");
             log.error("stage=STOCK_ROLLBACK requestNo={} result=ERROR 库存暂时泄漏，待对账修正",
                     requestNo, e);
             return false;
+        } finally {
+            metrics.luaTimer("rollback", System.nanoTime() - t0);
         }
     }
 
@@ -158,16 +180,23 @@ public class SeckillExecutor {
                 RedisKeys.stock(activityId, skuId),
                 RedisKeys.released(activityId, skuId),
                 RedisKeys.goods(activityId, skuId));
+        long t0 = System.nanoTime();
         try {
             Long r = redis.execute(releaseScript, keys, orderNo, String.valueOf(qty),
                     String.valueOf(props.getSeckill().getReleasedTtl().toSeconds()));
             boolean done = Long.valueOf(0L).equals(r);
+            if (done) {
+                metrics.stockRollback(activityId, skuId, "release");
+            }
             log.info("stage=STOCK_RELEASE_REDIS orderNo={} qty={} done={}", orderNo, qty, done);
             return done;
         } catch (Exception e) {
+            metrics.redisUncertain("release");
             log.error("stage=STOCK_RELEASE_REDIS orderNo={} result=ERROR 库存暂时泄漏，待对账修正",
                     orderNo, e);
             return false;
+        } finally {
+            metrics.luaTimer("release", System.nanoTime() - t0);
         }
     }
 
@@ -234,6 +263,44 @@ public class SeckillExecutor {
     }
 
     /**
+     * 请求记录是否存在。
+     *
+     * <p><b>不确定结果处理的唯一判据。</b> 脚本 A 的原子性保证"预扣库存"与
+     * "写 req key"要么都发生要么都不发生，所以
+     * {@code req key} 存在 ⟺ 库存已扣。存在则补发消息，不存在则脚本没执行过、
+     * 库存没动、什么都不用做。
+     *
+     * <p><b>读失败必须抛而不是返回 false。</b> 返回 false 会被判成"脚本没执行"，
+     * 于是一份已扣的库存永远没人补消息也没人回补——把一个"暂时读不到"
+     * 变成了一个永久泄漏。抛出去则本轮跳过，记录留在待确认集合里下轮再试。
+     */
+    public boolean requestExists(long activityId, long skuId, String requestNo) {
+        return Boolean.TRUE.equals(
+                redis.hasKey(RedisKeys.request(activityId, skuId, requestNo)));
+    }
+
+    /**
+     * Redis 调用结果不确定。
+     *
+     * <p>刻意<b>不</b>继承 {@code BizException}：调用方必须显式处理它
+     * （登记待确认），而不是当成一个普通的业务错误码放过去。
+     * 它也因此会被 Sentinel 计入异常统计——Redis 超时确实是故障，
+     * 而"库存不足"不是。
+     */
+    public static class UncertainResultException extends RuntimeException {
+        private final String requestNo;
+
+        public UncertainResultException(String requestNo, Throwable cause) {
+            super("Redis 调用结果不确定: " + requestNo, cause);
+            this.requestNo = requestNo;
+        }
+
+        public String getRequestNo() {
+            return requestNo;
+        }
+    }
+
+    /**
      * @param userId 字符串形式。Redis Hash 里存的就是字符串，
      *               在这里解析成 long 意味着脏数据会变成 NumberFormatException，
      *               而这只是一个用来做归属校验的值，比对字符串就够了
@@ -244,5 +311,9 @@ public class SeckillExecutor {
     private static String str(Object o) {
         String s = o == null ? null : String.valueOf(o);
         return s == null || s.isEmpty() ? null : s;
+    }
+
+    private static long millis(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000;
     }
 }

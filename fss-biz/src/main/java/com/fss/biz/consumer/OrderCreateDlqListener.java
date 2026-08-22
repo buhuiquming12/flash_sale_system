@@ -9,6 +9,8 @@ import com.fss.common.util.JsonUtil;
 import com.fss.domain.entity.ReconcileTask;
 import com.fss.domain.mapper.ReconcileTaskMapper;
 import com.fss.domain.message.OrderCreateMessage;
+import com.fss.infra.alarm.AlarmService;
+import com.fss.infra.metrics.SeckillMetrics;
 import com.fss.infra.mq.MqTopics;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -52,12 +54,15 @@ public class OrderCreateDlqListener implements RocketMQListener<MessageExt> {
 
     private final SeckillCompensateService compensateService;
     private final ReconcileTaskMapper      reconcileMapper;
+    private final SeckillMetrics           metrics;
+    private final AlarmService             alarm;
 
     @Override
     public void onMessage(MessageExt ext) {
         String body = new String(ext.getBody(), StandardCharsets.UTF_8);
         log.error("stage=DLQ topic={} keys={} reconsume={} body={}",
                 ext.getTopic(), ext.getKeys(), ext.getReconsumeTimes(), body);
+        metrics.dlq(MqTopics.ORDER_CREATE);
 
         OrderCreateMessage msg = null;
         try {
@@ -67,6 +72,7 @@ public class OrderCreateDlqListener implements RocketMQListener<MessageExt> {
         }
 
         recordTask(ext, body, msg);
+        alarm.p2(AlarmService.Event.MQ_DLQ, ext.getKeys(), "订单创建消息进入死信队列");
 
         if (msg == null) {
             return;
@@ -98,6 +104,7 @@ public class OrderCreateDlqListener implements RocketMQListener<MessageExt> {
                     .detail(body)
                     .status(ReconcileTaskStatus.NEED_MANUAL.code())
                     .build());
+            metrics.reconcileDiff("qualification", "need_manual");
         } catch (Exception e) {
             log.error("stage=DLQ keys={} result=RECORD_FAILED 对账任务都没落上，只剩这条日志",
                     ext.getKeys(), e);

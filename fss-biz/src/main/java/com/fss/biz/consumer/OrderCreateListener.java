@@ -11,6 +11,7 @@ import com.fss.common.util.JsonUtil;
 import com.fss.domain.entity.Order;
 import com.fss.domain.mapper.MqMessageMapper;
 import com.fss.domain.message.OrderCreateMessage;
+import com.fss.infra.metrics.SeckillMetrics;
 import com.fss.infra.mq.MqTopics;
 import com.fss.infra.tx.TxSupport;
 import lombok.RequiredArgsConstructor;
@@ -69,6 +70,7 @@ public class OrderCreateListener implements RocketMQListener<MessageExt> {
     private final SeckillCompensateService compensateService;
     private final SeckillExecutor          executor;
     private final MqMessageMapper          mqMapper;
+    private final SeckillMetrics           metrics;
 
     @Override
     public void onMessage(MessageExt ext) {
@@ -107,6 +109,14 @@ public class OrderCreateListener implements RocketMQListener<MessageExt> {
             OrderCreateService.Created created = orderCreateService.handle(msg);
             Order order = created.order();
 
+            // 埋点放在<b>回写结论之前</b>。回写是"让外部看到成功"的那一刻，
+            // 之后指标才出现的话，任何观察者（看板、告警、测试）都有一个窗口
+            // 能看到"订单已成功"而 fss_order_created_total 还没动。
+            // 这个窗口只有几毫秒且指标是最终一致的，但顺序对了就不必解释它
+            if (!created.duplicate()) {
+                metrics.orderCreated(msg.getActivityId(), msg.getSkuId());
+            }
+
             // 结论回写必须在<b>事务提交之后</b>。提交前写的话，客户端可能查到
             // "秒杀成功 + 订单号"，而那个事务随后回滚了——它拿着一个不存在的订单号
             writeSuccessAfterCommit(msg, order);
@@ -127,6 +137,8 @@ public class OrderCreateListener implements RocketMQListener<MessageExt> {
                 markConsumed(ext);
                 return;
             }
+            metrics.orderCreateFailed(msg.getActivityId(), msg.getSkuId(),
+                    ec.name().toLowerCase());
             if (ec.isDeterministic()) {
                 log.warn("stage=ORDER_CREATE requestNo={} result=DETERMINISTIC_FAIL code={} 立即回补",
                         msg.getRequestNo(), ec.name());
@@ -142,6 +154,7 @@ public class OrderCreateListener implements RocketMQListener<MessageExt> {
         } catch (Exception e) {
             // DB 连不上、超时、死锁 —— 下一次可能就成了。抛出触发重试；
             // 5 次耗尽后进死信，由死信消费者回补，不会永久占着库存
+            metrics.orderCreateFailed(msg.getActivityId(), msg.getSkuId(), "error");
             log.error("stage=ORDER_CREATE requestNo={} result=ERROR reconsume={} 触发重试",
                     msg.getRequestNo(), ext.getReconsumeTimes(), e);
             throw new IllegalStateException("落库失败，待重试: " + msg.getRequestNo(), e);

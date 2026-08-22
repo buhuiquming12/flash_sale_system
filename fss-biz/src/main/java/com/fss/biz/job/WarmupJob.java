@@ -3,8 +3,10 @@ package com.fss.biz.job;
 import com.fss.biz.activity.service.WarmupService;
 import com.fss.domain.entity.SeckillActivity;
 import com.fss.domain.mapper.SeckillActivityMapper;
+import com.fss.infra.alarm.AlarmService;
 import com.fss.infra.config.FssProperties;
 import com.fss.infra.lock.DistributedLock;
+import com.fss.infra.metrics.SeckillMetrics;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Profile;
@@ -33,6 +35,8 @@ public class WarmupJob {
 
     private final SeckillActivityMapper activityMapper;
     private final WarmupService         warmupService;
+    private final SeckillMetrics        metrics;
+    private final AlarmService          alarm;
     private final FssProperties         props;
 
     @Scheduled(cron = "${fss.job.warmup-cron:0 * * * * ?}")
@@ -53,8 +57,11 @@ public class WarmupJob {
                 ok++;
             } catch (Exception e) {
                 failed++;
+                metrics.jobError("warmup");
                 log.error("stage=JOB_WARMUP activityId={} result=ERROR 活动将不会进入进行中",
                         a.getId(), e);
+                alarm.p2(AlarmService.Event.WARMUP_FAILED, String.valueOf(a.getId()),
+                        "活动预热失败，不会进入进行中: " + e.getMessage());
                 try {
                     warmupService.markFailed(a.getId());
                 } catch (Exception ignored) {

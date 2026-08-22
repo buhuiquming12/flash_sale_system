@@ -26,6 +26,15 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
+        <!--
+            actuator 只提供端点框架，/actuator/prometheus 这个端点由 registry 自己注册。
+            少了它，application.yml 里 exposure.include 写了 prometheus 也不会报错，
+            端点就是 404 —— 而这种"配了但没生效"的缺口在部署当天才会被发现。
+        -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.springdoc</groupId>
             <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>

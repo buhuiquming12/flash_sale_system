@@ -6,6 +6,7 @@ import com.fss.biz.payment.model.PayCreateVO;
 import com.fss.biz.payment.model.PayNotifyCmd;
 import com.fss.biz.payment.model.PayStatusVO;
 import com.fss.biz.payment.service.PaymentService;
+import com.fss.biz.payment.service.RefundService;
 import com.fss.common.enums.OrderStatus;
 import com.fss.common.enums.PayStatus;
 import com.fss.common.error.Assert;
@@ -19,6 +20,7 @@ import com.fss.domain.mapper.OrderMapper;
 import com.fss.domain.mapper.PaymentMapper;
 import com.fss.domain.mapper.SeckillGoodsMapper;
 import com.fss.infra.config.FssProperties;
+import com.fss.infra.metrics.SeckillMetrics;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DuplicateKeyException;
@@ -38,6 +40,8 @@ public class PaymentServiceImpl implements PaymentService {
     private final PaymentMapper      paymentMapper;
     private final OrderMapper        orderMapper;
     private final SeckillGoodsMapper goodsMapper;
+    private final RefundService      refundService;
+    private final SeckillMetrics     metrics;
     private final FssProperties      props;
 
     @Override
@@ -149,12 +153,13 @@ public class PaymentServiceImpl implements PaymentService {
                 return;
             }
             if (status == OrderStatus.CANCELLED.code()) {
-                // 钱收到了但订单已关闭 → 记为成功流水 + 转退款 + 告警
+                // 钱收到了但订单已关闭 → 先如实记成成功流水（钱确实收了，
+                // 账不能不认），再走退款。顺序反了的话 refund 的
+                // "from = SUCCESS" 条件更新会一行都改不到，退款静默失败
                 markPaymentSuccess(cmd, rawBody);
-                paymentMapper.updateStatus(cmd.getPayNo(),
-                        PayStatus.SUCCESS.code(), PayStatus.REFUNDED.code());
-                log.error("stage=PAY_CANCEL_RACE orderNo={} payNo={} action=AUTO_REFUND "
-                                + "reason=订单已关闭但支付成功，需人工确认退款到账",
+                refundService.refund(cmd.getPayNo(), orderNo,
+                        "支付与关单竞态：订单已关闭，库存已回补给其他用户");
+                log.error("stage=PAY_CANCEL_RACE orderNo={} payNo={} action=REFUND",
                         orderNo, cmd.getPayNo());
                 return;
             }
@@ -172,6 +177,7 @@ public class PaymentServiceImpl implements PaymentService {
             log.error("stage=PAY_SUCCESS orderNo={} warn=LOCKED_STOCK_INSUFFICIENT "
                     + "库存账目异常，需对账介入", orderNo);
         }
+        metrics.orderPaid(order.getActivityId(), order.getSkuId());
         log.info("stage=PAY_SUCCESS orderNo={} payNo={} amount={}",
                 orderNo, cmd.getPayNo(), cmd.getAmount());
     }

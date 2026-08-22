@@ -1,0 +1,40 @@
+# Prometheus 抓取配置。
+#
+# 抓取间隔 15s：秒杀活动本身只有几分钟到几十分钟，间隔给到 1 分钟的话
+# 一场活动只有几个数据点，曲线画不出形状。15s 是"能看出趋势"与
+# "不给应用加太多负担"之间的折中。
+#
+# 注意应用侧的库存仪表是<b>推送式</b>的（对账任务算完顺手写内存，抓取只读内存），
+# 所以抓取频率高不会引发额外的 Redis/DB 查询。改成回调式采样的话，
+# 这里每 15 秒就会触发一轮真实查询，而 Redis 一慢整个端点就超时——
+# 连"Redis 慢了"这件事都看不到了。见 SeckillMetrics.publishStockGauges 的注释。
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    env: local
+
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
+scrape_configs:
+  - job_name: fss-app
+    metrics_path: /actuator/prometheus
+    static_configs:
+      # 本地开发时应用跑在宿主机上，容器里要用 host.docker.internal 才能回连。
+      # 多实例部署时这里换成各实例地址，或接服务发现
+      - targets:
+          - host.docker.internal:8080
+        labels:
+          instance_role: all-in-one
+      # 按 docs/08 的部署拓扑起多实例时用下面这些（默认注释掉）
+      # - targets: ["fss-web-1:8080", "fss-web-2:8080"]
+      #   labels: { instance_role: web }
+      # - targets: ["fss-consumer-1:8080", "fss-consumer-2:8080"]
+      #   labels: { instance_role: consumer }
+      # - targets: ["fss-job:8099"]
+      #   labels: { instance_role: job }
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

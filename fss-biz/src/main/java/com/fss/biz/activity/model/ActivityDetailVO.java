@@ -57,10 +57,44 @@ public class ActivityDetailVO {
         private java.math.BigDecimal    originPrice;
         private java.math.BigDecimal    seckillPrice;
         private Integer                 totalStock;
-        /** 近似值，仅用于展示。真实结论以秒杀接口为准 */
+        /**
+         * 近似值，仅用于展示。真实结论以秒杀接口为准。
+         *
+         * <p>降级 Level 1 起<b>置为 null</b>，改用 {@link #stockLevel}。
+         * 这么做省掉的正是每个 SKU 一次 Redis 读——一个活动 10 个 SKU 就是 10 次往返，
+         * 而详情接口是全站 QPS 最高的那个。
+         */
         private Integer                 remainStock;
+        /** 粗粒度库存档位。始终有值，降级时它是唯一的库存信息来源 */
+        private StockLevel              stockLevel;
         private Integer                 limitPerUser;
         private boolean                 soldOut;
         private String                  image;
+    }
+
+    /**
+     * 库存档位。
+     *
+     * <p>存在的理由是降级：{@code remainStock} 要一次 Redis 读，而"还有没有货"
+     * 这个信息用 DB 快照就够。同时它对<b>正常</b>状态也有价值——
+     * 前端可以只靠这个字段决定文案（"仅剩 3 件"用精确值，"库存紧张"用档位），
+     * 不必自己定阈值，于是降级前后的展示逻辑是同一套。
+     */
+    public enum StockLevel {
+        /** 充足：> 20% */
+        AVAILABLE,
+        /** 紧张：0 < remain <= 20% */
+        LOW,
+        SOLD_OUT;
+
+        public static StockLevel of(Integer remain, Integer total) {
+            if (remain == null || remain <= 0) {
+                return SOLD_OUT;
+            }
+            if (total == null || total <= 0) {
+                return AVAILABLE;
+            }
+            return remain * 5 <= total ? LOW : AVAILABLE;
+        }
     }
 }

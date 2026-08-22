@@ -1,7 +1,21 @@
 # =====================================================================
-# 阶段一：只需要 MySQL。
-# 阶段二加 redis，阶段三加 rocketmq，阶段四加 prometheus/grafana/loki，
-# 届时在本文件追加，不另起文件——一份拓扑比三份好维护。
+# 一份拓扑覆盖全部阶段，用 profiles 控制启停，不另起文件——
+# 三份 compose 文件必然漂移，而漂移的那一处只会在部署当天暴露。
+#
+#   （默认）  mysql
+#   phase2    redis
+#   phase3    rocketmq namesrv + broker
+#   phase4    prometheus + grafana
+#   phase5    nginx（多实例部署形态才有意义）
+#
+# 阶段四起的常用起法：
+#   docker compose --profile phase2 --profile phase3 --profile phase4 up -d
+#
+# 注意 down -v 时<b>必须带上全部 profile</b>，否则 compose 不认识那些服务，
+# 它们的命名卷会留下来：redis-data 带着上一轮的 stock/bought 活到下一轮，
+# 而 mysql-data 被删了、activityId 从 1 重新开始——两边一对上就是
+# "库存莫名少了几个"。清干净的写法：
+#   docker compose --profile phase2 --profile phase3 --profile phase4 --profile phase5 down -v
 # =====================================================================
 name: fss
 
@@ -99,6 +113,54 @@ services:
       - "10911:10911"
       - "10912:10912"
 
+  # ==================================================================
+  # 阶段四：监控栈
+  # ==================================================================
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: fss-prometheus
+    profiles: ["phase4"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # 演示环境保 7 天够了。秒杀活动本身只有几十分钟，
+      # 需要长期留存的是压测报告里的截图，不是原始数据
+      - --storage.tsdb.retention.time=7d
+      # 开热加载：改了 alert-rules.yml 之后 curl -XPOST /-/reload 即可，
+      # 不必重启容器（重启会丢掉内存里还没落盘的样本）
+      - --web.enable-lifecycle
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - prometheus-data:/prometheus
+    # Linux 上 host.docker.internal 默认不存在（那是 Docker Desktop 的特性），
+    # 加这一行让 prometheus.yml 里的 target 在两种平台上都能解析到宿主机
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: fss-grafana
+    profiles: ["phase4"]
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # 演示环境免登录直接看图。生产绝不能开——它等于把看板公开，
+      # 而看板上有活动名称、库存量、订单量这些业务数据
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # 打开后直接落到总览看板，省掉演示时的两次点击
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/fss-overview.json
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
   # 四级限流的第一级。只在多实例部署形态下才有意义（它要 proxy_pass 到
   # fss-web-1 / fss-web-2 两个容器），本地开发时应用跑在宿主机上，
   # 所以放在 phase5 profile 里默认不启动。配置本身见 docker/nginx/nginx.conf
@@ -114,3 +176,5 @@ services:
 volumes:
   mysql-data:
   redis-data:
+  prometheus-data:
+  grafana-data:

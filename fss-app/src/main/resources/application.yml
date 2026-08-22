@@ -52,6 +52,15 @@ spring:
         shutdown-timeout: 200ms
   lifecycle:
     timeout-per-shutdown-phase: 20s
+  task:
+    scheduling:
+      # 默认是 1。阶段四之前只有几个互不重叠的 cron 任务，1 个线程够用；
+      # 现在多了 DegradeSwitch 每秒刷新一次开关，而它和"扫描关单"共用这个池——
+      # 单线程下一轮扫了 3 分钟的关单任务会让降级开关整整 3 分钟不更新，
+      # 恰好是最需要它更新的时候。给 4 个线程让快慢任务互不阻塞
+      pool:
+        size: 4
+      thread-name-prefix: fss-sched-
 
 # ---------------------------------------------------------------------
 # RocketMQ。
@@ -91,6 +100,11 @@ mybatis-plus:
       # 逻辑删除未启用：订单、库存流水都必须物理保留，做审计与对账的依据
 
 management:
+  # /actuator/prometheus 由 micrometer-registry-prometheus 注册。
+  # 只在 include 里写 prometheus 而没有那个依赖时，端点是 404 且不报错
+  metrics:
+    tags:
+      application: fss
   endpoints:
     web:
       exposure:
@@ -161,11 +175,28 @@ fss:
       stock-rollback: GID_FSS_STOCK_ROLLBACK
     send-timeout: 2000
     max-resend: 5
+    # 启动 DefaultMQAdminExt 采集积压量。它是一个额外的 MQ 客户端，
+    # broker 不可达时会每轮刷一条连接失败日志，所以默认值是 false，这里显式打开
+    backlog-monitor-enabled: true
   degrade:
-    seckill-enabled: true
-    backlog-threshold: 50000
-    # 下发给客户端的轮询间隔。降级 Level 2 时拉到 2000，不用发版
+    seckill-enabled: true         # 人工总闸。与自动降级是"与"关系，自动只能收紧
+    refresh-delay-ms: 1000        # 本地缓存刷新间隔，开关最多延迟这么久生效
+    level-ttl-seconds: 300        # 自动降级值的 TTL；写入者崩溃时能自己过期
+    # 下发给客户端的轮询间隔。Level 2 起换成 degraded 那个值，不用发版
     poll-interval-ms: 300
+    degraded-poll-interval-ms: 2000
+    auto-enabled: true
+    backlog-threshold: 50000      # 积压超阈值 → Level 3（暂停新资格分配）
+    stalled-rounds: 4             # 消费端连续 4 轮无进展且仍有积压 → Level 3
+    db-pending-threshold: 5       # 连接池等待线程超阈值 → Level 2
+    recover-ratio: 0.5            # 恢复阈值 = 触发阈值 × 该比例（滞回，防抖动）
+  reconcile:
+    orphan-after: 5m              # 排队中超过这么久还没结论才算孤儿
+    orphan-rounds-before-rollback: 3
+    payment-diff-after: 5m        # 给正常的回调延迟留窗口
+    batch-size: 500
+    uncertain-retention: 10m      # 超期仍无法判定 → 转人工（不自动回补，方向未知）
+    uncertain-settle: 5s          # 静置窗口：超时那一刻脚本可能正在执行
   jwt:
     # 生产必须由环境变量 FSS_JWT_SECRET 注入
     secret: ${FSS_JWT_SECRET:fss-local-dev-only-secret-change-me-in-prod}
@@ -179,3 +210,11 @@ fss:
     activity-state-cron: "0 * * * * ?"
     warmup-cron: "0 * * * * ?"
     mq-resend-delay-ms: 30000
+    # 三类对账的频率不同是刻意的：资格对账最频繁（用户正在等），
+    # 库存对账最贵（SCAN + 多次 DB），支付对账最不急但最严重。见 ReconcileJob 注释
+    reconcile-qualification-cron: "0 * * * * ?"
+    reconcile-stock-cron: "0 */5 * * * ?"
+    reconcile-payment-cron: "0 */10 * * * ?"
+    uncertain-check-delay-ms: 10000
+    # 必须明显小于 fss.degrade.level-ttl-seconds，否则自动降级值会在两轮之间过期抖动
+    degrade-monitor-delay-ms: 15000

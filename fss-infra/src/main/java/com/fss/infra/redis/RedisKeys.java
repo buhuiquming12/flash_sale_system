@@ -45,6 +45,22 @@ public final class RedisKeys {
         return "seckill:released:" + tag(activityId, skuId);
     }
 
+    /**
+     * Redis 调用结果不确定的请求集合（ZSet，score = 记录时刻的 epoch millis）。
+     *
+     * <p><b>不带 hash tag</b>：它跨活动跨 SKU，是一张全局待办清单，
+     * 加 tag 反而要按活动开 N 个 key、扫描时不知道该扫哪些。
+     * 它也不参与任何 Lua 多 key 操作，单独 ZADD / ZRANGEBYSCORE / ZREM 即可。
+     */
+    public static String uncertain() {
+        return "seckill:uncertain";
+    }
+
+    /** 资格对账里"同一孤儿请求连续几轮无结论"的计数。TTL 1h，防每轮都重发造成消息风暴 */
+    public static String orphanCount(String requestNo) {
+        return "reconcile:orphan:count:" + requestNo;
+    }
+
     /** 活动详情缓存（逻辑过期包装） */
     public static String activityDetail(long activityId) {
         return "activity:detail:" + activityId;

@@ -11,7 +11,8 @@
 ```
 
 阶段三起主链路已经是这个形状：秒杀接口只做「Lua 判扣 + 投一条消息」就返回排队中，
-订单由消费端创建，关单由任意时刻定时消息触发。剩下的「对账补偿」是阶段四。
+订单由消费端创建，关单由任意时刻定时消息触发。阶段四补上了最后那段「对账补偿」，
+以及它旁边的降级与监控。
 
 ## 技术栈
 
@@ -24,7 +25,7 @@
 | 消息队列 | Apache RocketMQ 5.3.0 + rocketmq-spring-boot-starter 2.3.1 |
 | 限流熔断 | Nginx `limit_req` + Sentinel 1.8.x + Redis Lua 令牌桶 |
 | 认证 | Spring Security 6 + JWT |
-| 可观测 | Micrometer + Prometheus + Grafana + Loki |
+| 可观测 | Micrometer + Prometheus 2.54 + Grafana 11.2 |
 | 接口文档 | Springdoc OpenAPI 2.x |
 | 测试 | JUnit 5 + Testcontainers + JMeter |
 | 部署 | Docker Compose |
@@ -53,8 +54,9 @@
 需要 JDK 17、Maven 3.9+、Docker。
 
 ```bash
-# 1. 起 MySQL、Redis、RocketMQ（MySQL 首次启动会自动执行 sql/V1__init.sql 建表）
-docker compose --profile phase2 --profile phase3 up -d
+# 1. 起 MySQL、Redis、RocketMQ、Prometheus、Grafana
+#    （MySQL 首次启动会自动执行 sql/V1__init.sql 建表）
+docker compose --profile phase2 --profile phase3 --profile phase4 up -d
 
 # 2. 建 Topic（autoCreateTopicEnable=false，必须显式创建；只需在 broker 首次起来后做一次）
 docker cp docker/rocketmq/init-topics.sh fss-rmq-broker:/home/rocketmq/init-topics.sh
@@ -72,14 +74,26 @@ java -jar fss-app/target/fss-app.jar \
 
 - 演示页面：<http://localhost:8080/index.html>
 - 接口文档：<http://localhost:8080/swagger-ui.html>
+- **Grafana 看板**：<http://localhost:3000>（匿名可看，打开即是「秒杀系统总览」）
+- **Prometheus**：<http://localhost:9090>（`/alerts` 看 16 条告警规则的实时状态）
 - 演示账号：`admin` / `demo1` / `demo2` / `demo3`，密码统一 `Passw0rd1`
 - 启动后自动创建一个「1 分钟后开抢、库存 100、每人限 1 件」的活动并完成 Redis 预热
 
 **`consumer` profile 必须激活**：阶段三起订单由消费端创建，不激活它所有秒杀都会
-永远停在"排队中"。
+永远停在"排队中"。**`job` profile 决定对账、降级监控、关单扫描跑不跑**——
+不激活时主链路仍然完整（关单靠定时消息），但所有兜底机制都不在。
 
 注意 `server.port` 必须显式指定：`application-job.yml` 里设了 8099、
 `application-consumer.yml` 设了 8090，profile 顺序靠后的会覆盖前面的。
+
+`docker compose down -v` **必须带上全部 profile**，否则 compose 不认识那些服务，
+它们的命名卷会留下来：`redis-data` 带着上一轮的 `stock`/`bought` 活到下一轮，
+而 `mysql-data` 被删了、activityId 从 1 重新开始——两边一对上就是"库存莫名少了几个"。
+清干净的写法：
+
+```bash
+docker compose --profile phase2 --profile phase3 --profile phase4 --profile phase5 down -v
+```
 
 Redis 地址默认 `127.0.0.1:6379`，可用 `FSS_REDIS_HOST` / `FSS_REDIS_PORT` 覆盖；
 RocketMQ 默认 `127.0.0.1:9876`，可用 `FSS_MQ_NAMESRV` 覆盖。
@@ -101,6 +115,8 @@ mvn clean verify
 测试用的 MQ 端口刻意错开 compose 的那套（namesrv 9877、broker 10921），
 所以 `mvn verify` 和联调环境可以同时活着。
 
+当前 **20 个测试类 / 144 个用例**，全绿约 5 分 45 秒。
+
 | 测试类 | 覆盖 |
 | --- | --- |
 | `OrderStateMachineTest` | 穷举 6×6 状态迁移：7 条合法、29 条拒绝 |
@@ -108,6 +124,11 @@ mvn clean verify
 | `SeckillLuaTest` | **P1 库存1000×10000并发**（含落库吞吐断言）、售罄快速失败、活动结束瞬间全拒、F14 时钟只认 Redis、未预热拒绝、结果查询命中 Redis |
 | `MqReliabilityTest` | **M1 只返回排队中**、M2 重复投递×10 仍 1 单（C6）、M3 消费端晚到不丢、M4 断开 MQ 堆积后重发（F4）、M5 重发耗尽即回补 |
 | `MqTopicConsistencyTest` | Topic/消费组的常量与配置项逐字一致（不需要容器） |
+| `ReconcileTest` | **C14 库存漂移自动修正**、Redis>DB 判 P1 不覆盖、DB 等式被破坏、有排队请求时不算差异、孤儿资格回补、结论丢失只补结论、支付对账 A/C/D 三类、差异去重 |
+| `UncertainAndRefundTest` | **F8** 已执行则补发/未执行则不动/静置窗口/按原始串移除/重复判定幂等、**F9** 支付关单竞态自动退款与幂等 |
+| `DegradeTest` | 分级行为（L1 库存档位、L2 轮询间隔、L3 停资格、L4 停浏览）、人工与自动取最大值、脏值处理、TTL 区别、降级等级进指标 |
+| `MetricsTest` | 关键指标存在、失败原因用标签、**标签基数有界**（禁 userId/requestNo）、告警指标形状 |
+| `MetricsExportTest` | **导出文本**里的指标名与告警规则/看板逐一对齐（不需要容器，毫秒级） |
 | `SeckillRedisStockTest` | 取消回补 Redis 库存但保留资格、重复回补幂等、确定性失败不归还资格、售罄标记复位 |
 | `WarmupTest` | 重复预热不重置库存、元数据可覆盖、已结束活动预热不崩、`warmup_state` 置位、关闭活动同步 Redis |
 | `ActivityCacheTest` | 缓存命中、`serverTime`/库存不被缓存、空值缓存、逻辑过期后台重建、管理操作失效缓存、脏缓存自愈 |
@@ -123,8 +144,39 @@ mvn clean verify
 - [x] **阶段一** 基础业务闭环（纯 MySQL 同步链路）
 - [x] **阶段二** Redis 缓存 + Lua 原子判扣 + 四级限流
 - [x] **阶段三** RocketMQ 异步化 + 本地消息表
-- [ ] 阶段四 补偿、对账、降级、监控
+- [x] **阶段四** 补偿、对账、降级、监控
 - [ ] 阶段五 压测报告、故障演练报告、架构图
+
+### 阶段四做了什么
+
+前三个阶段建的是"正常路径 + 局部兜底"，阶段四补的是**最后一层：当上面全都失效时，
+差异能不能被发现并收敛**。
+
+```
+不确定结果 → checkUncertain（EXISTS req key 判定，补发或放过）
+资格孤儿   → 资格对账（按消息表状态五分支处置）
+库存漂移   → 库存对账（三条等式，严格前提下自动修正）
+资金差异   → 支付对账（四类，只有一类可自动修）+ 退款流程
+压力上来   → 自动降级（积压/连接池 → 分级收紧，滞回恢复）
+以上全部   → 指标 + 16 条告警规则 + Grafana 看板
+```
+
+- **三类对账任务**，频率刻意不同：资格每分钟（用户正在等）、库存每 5 分钟（最贵）、
+  支付每 10 分钟（给回调延迟留窗口）。每个都有分布式锁，而这里的锁**保正确不只省资源**
+- **库存对账拆成三条独立等式**：商品表自洽、商品表与订单表吻合、Redis 与 DB 的差值
+  等于排队中量。差异能直接定位到某一层；自动修正只在「DB 自洽 且 无排队请求」时才敢做
+- **不确定结果处理**：Lua 超时时无法判断库存扣没扣，登记进 Redis ZSet，
+  静置 5 秒后用 `EXISTS req key` 判定——脚本 A 的原子性保证
+  `req key 存在 ⟺ 库存已扣`，这条等价关系是整个机制的基石
+- **降级五级 + 自动降级**：人工与自动是两个 key、生效等级取最大值，
+  所以自动机制只能收紧、永远盖不过人的决定。目标等级 = 各条件的最大值，
+  天然支持自动恢复且无需记状态
+- **退款流程**：支付与关单竞态输给关单时，先如实记成功流水再标记退款、
+  落对账任务、P1 告警。CANCELLED 是终态没有回头路，所以只能退款而不能把订单拉回来
+- **告警统一出口** `AlarmService`：固定日志格式 + `fss_alarm_total` 指标双通道，
+  `event` 是有限常量集合。不做重复抑制（收敛交给 Prometheus 的 `for:`）
+- **库存仪表用推送而不是回调采样**：对账任务本来就要读那四个值，顺手写内存；
+  回调式会让每次抓取都产生 IO，而 Redis 一慢连"Redis 慢了"这条曲线自己都断掉
 
 ### 阶段三做了什么
 
@@ -256,6 +308,53 @@ Redis 与 Lettuce / Redisson 的分工是刻意的：Lua 与普通读写走 Lett
     分不开的话重复投递会被当成失败无限重试，最后整批进死信——一个纯粹由
     "把幂等命中误判成失败"造出来的故障。多查一次 `SISMEMBER released` 把两者分开。
 
+**阶段四**
+
+18. **库存对账的 `dbOk` 判据是错的**。docs/05 §9.2 写
+    `available + occupied + queueing == total`，而 `queueing` 是"Redis 已预扣但还没
+    落库"的量，**它根本还没到 DB**。加进 DB 的等式里，只要有排队中请求 `dbOk` 就恒为假，
+    于是每轮都判"DB 漂移"、自动修正永远不触发（它的前提正是 `dbOk`）、
+    每 5 分钟刷一条"需人工"。症状是"对账一直在报差异，但库存其实是对的"。
+    现在拆成三条独立等式，差异能定位到具体某一层。
+19. **支付对账 A 类的 SQL 必须限定 `o.status = 0`**。文档写的
+    `NOT IN (1,3,4,5)` 把 `status = 2`（已取消）也捞进来了，而那是 D 类，
+    处置方式**正好相反**：A 类补推订单到已支付，D 类绝不能补推（关单已经把库存还给
+    别人了，补推等于超卖）。两类混在一条查询里，自动修复会把资损事件"修"成超卖事件。
+    另外 A 类补推**必须连 `locked → sold` 一起做**，只改订单状态会让 `locked` 里
+    永久留一份已卖出的量——而这种不一致库存对账发现不了（三条等式都还成立）。
+20. **不确定结果的登记簿用 ZSet 而不是 List**。docs/04 §5 给的是 List，
+    但 `LPOP` 取出即出队，处理过程崩了记录就消失——而它正是"不知道库存扣没扣"的唯一
+    线索；改用 `LRANGE` 不删则要 `LREM` 按值删，O(N)。而且 List 没有时间维度，
+    做不了那个必需的静置窗口（超时那一刻脚本可能**正在**执行，立刻判定"没执行"
+    会把一份已扣的库存留成永久泄漏）。
+21. **降级开关要拆成人工与自动两个 key，生效等级取最大值**。只有一个 key 时，
+    运维手动降到 Level 4，下一轮自动计算（每 15 秒）就把它抹回 0——而做这个决定的人
+    正在处理别的事故，根本不知道开关自己弹回去了。人工那个不带 TTL（人的决定不该
+    悄悄失效），自动那个带 TTL（写入者崩溃后没人负责删它）。
+22. **自动降级的目标等级 = 各条件的最大值**，不是"最后一个触发的条件"。
+    逐条件顺序覆盖会出现：积压超阈值判 Level 3，接着"连接池正常"把它写回 0，
+    于是秒杀在积压 8 万条的情况下重新开闸。取最大值顺带解决了自动恢复——
+    每轮从 0 重算，所有条件退回时结果自然是 0，不需要记"是谁触发的"。
+    采不到数据时让这一条**不参与计算**而不是当成 0：broker 挂了正是最该降级的时候。
+23. **指标名不能带 Prometheus 的保留后缀**，而这个坑**单元测试抓不到**。
+    Micrometer 注册的名字和导出到 `/actuator/prometheus` 的名字不是一个东西：
+    `fss_order_created_total` 被剥成 `fss_order_total`、`fss_stock_total`（Gauge）
+    被剥成 `fss_stock`，而 `registry.find(原名)` 在**注册侧**照样命中。
+    结果是断言指标存在的用例全绿，告警规则和看板却在查不存在的序列——
+    **Prometheus 对查不到序列的表达式既不报错也不告警**。同理
+    `publishPercentiles` 与 `publishPercentileHistogram` 只差一个词，
+    前者导出 `{quantile=...}`、后者导出 `_bucket`，而 `histogram_quantile()` 只认后者。
+    三处都是联调时发现的，现在由 `MetricsExportTest` 直接断言导出文本，
+    并把 `alert-rules.yml` 与看板 JSON 里的每个指标名都对一遍。
+24. **库存仪表要用推送而不是回调采样**。`Gauge.builder(name, () -> readRedis())`
+    在每次抓取时执行，1 个活动 10 个 SKU × 4 个指标 = 一次抓取 40 次查询，
+    15 秒一轮就是稳定的负载源。更糟的是失败模式：Redis 变慢 → 抓取超时 →
+    整个端点失败 → 连"Redis 慢了"都看不到，因为报告它的曲线也断了。
+    改成对账任务顺手写内存、抓取只读内存，代价是滞后一个对账周期。
+25. **定时任务线程池必须从默认的 1 调大**。`DegradeSwitch` 每秒刷新与"扫描关单"
+    共用这个池，单线程下一轮跑 3 分钟的关单会让降级开关整整 3 分钟不更新——
+    恰好是最需要它更新的时候。
+
 另修了一个阶段一联调时才暴露的缺陷：MySQL 容器默认时区 UTC，`NOW(3)` 与列
 `DEFAULT CURRENT_TIMESTAMP(3)` 写入的时间比 Java 侧写入的 `LocalDateTime`
 慢 8 小时。已在 compose 与 Testcontainers 两处统一加 `--default-time-zone=+08:00`，
@@ -281,24 +380,50 @@ Redis 与 Lettuce / Redisson 的分工是刻意的：Lua 与普通读写走 Lett
   （ERROR_NO_SYSTEM_RESOURCES：客户端每次实例化都要枚举网卡，而 Docker Desktop
   会造出一大堆虚拟网卡）。合并成一个上下文顺带省掉两次启动。
 
-### 阶段三已知限制
+### 阶段四踩到的坑
+
+- **`micrometer-registry-prometheus` 不会被 actuator 自动带进来**。
+  `management.endpoints.web.exposure.include` 里写了 `prometheus` 而没有这个依赖时，
+  端点是 404 且**不报任何错**——配了但没生效，部署当天才会发现。
+- **Grafana 数据源的 `uid` 必须写死**。不写时 Grafana 生成随机 uid
+  （形如 `PBFA97CFB590B2093`），而看板 JSON 里的模板变量是按 uid 引用数据源的。
+  症状是"图都有，就是活动筛选框是空的"——面板本身走默认数据源反而正常，
+  很难联想到 uid 上。
+- **Linux 上 `host.docker.internal` 默认不存在**（那是 Docker Desktop 的特性），
+  Prometheus 抓宿主机上的应用要加 `extra_hosts: host.docker.internal:host-gateway`。
+- **MySQL 容器时钟与宿主时钟会漂**。测支付对账时用 `NOW(3)` 造 `finish_time`、
+  而筛选条件是 Java 侧算出的时刻，两者差出上百毫秒（WSL2 的 VM 时钟），
+  阈值又设成 0s，于是记录选不选中取决于当时的漂移方向——只在整套跑的时候偶发失败。
+  测试里改成从 Java 侧显式给一个过去时刻。
+
+### 阶段四已知限制
 
 - **Redis 单点**（演示环境）。生产需哨兵或 Cluster；Key 已带 hash tag，上 Cluster
   无需改代码。
-- **单 broker、消息数据不持久化到卷**。见上面那条坑：要持久化就得 `user: root`，
+- **单 broker、消息数据不持久化到卷**。要持久化就得 `user: root`，
   为演示环境授这个权不值得。`stop`/`start` 数据保留，`down` 之后 Topic 需重建。
 - **Nginx 只提供配置未接入本地运行**。它要 `proxy_pass` 到两个 web 容器，
   本地开发时应用跑在宿主机上，所以 compose 里放在 `phase5` profile 默认不启动。
-- **积压监控与自动降级未接入**。docs/05 §7 的 `checkBacklog`（读消息积压后写
-  `degrade:level`）需要 `DefaultMQAdminExt`，与三类对账任务一起放在阶段四。
-  `DegradeSwitch` 目前只有配置项形式的总开关。
-- **Redis 调用超时的不确定结果只记日志**。此时无法确定脚本是否已执行，
-  对用户报"系统繁忙"，库存差额留给阶段四的对账任务收敛。完整的 `checkUncertain`
-  需要 `t_reconcile_task` 真正跑起来。
+- **告警只到日志与指标，没有真实通道**。`P1` 是 `fss_alarm_total` 的一个标签，
+  不会真的打电话。触发点、分级、事件名都是真的，接通道只需在 `AlarmService`
+  里加一个 HTTP 调用。Alertmanager 也没起——Prometheus 的 `/alerts` 页面
+  已经能演示规则的实时状态。
+- **对账用 SCAN 遍历 Redis**。MATCH 模式在 Redis 侧是"先取回一批 key 再过滤"，
+  所以扫描量与库里总 key 数成正比而非匹配数。活动与 SKU 很多时会变贵，
+  替代方案是从 `t_seckill_request` 反向查——但那需要主链路同步写库，
+  等于把异步化的收益还回去一部分。当前量级下 SCAN 更划算。
+- **排队中请求的 TTL 是对账的时间窗口**。`seckill:req` 的 TTL 是 30 分钟，
+  一条真的卡住的请求如果 30 分钟内没被资格对账扫到，key 过期后就再也发现不了——
+  表现是"差异自己消失了"。资格对账每分钟一轮，正常情况下有 30 次机会，
+  但这个依赖关系值得写下来：调长 `orphan-after` 或调短 `result-ttl` 都会压缩它。
+- **`checkUncertain` 判定不了时只转人工，不自动回补**。此时的处境恰好是
+  "不知道库存扣没扣"，而回补一份没扣过的库存就是凭空增加库存 → 直接超卖。
+  少卖可以人工修，超卖要赔钱。差额留给库存对账发现。
+- **限购固定为 1**，所以资格对账回补时 `quantity` 写死 1。支持 >1 时必须从
+  `t_seckill_request` 或消息体读真实数量，否则会回补错数量。
 - **补偿回补目前是直接调用而非发消息**。`FSS_STOCK_ROLLBACK` 的生产者与消费者都已
   就位（重发放弃、死信兜底两条路径），但主链路上的确定性失败是消费端就地回补的——
-  它已经在自己的线程里，多绕一次 MQ 只增加延迟。走消息的价值在"Redis 也不可用"
-  那种场景，属于阶段四的降级演练。
-- **令牌串错误时令牌也会被消费**。`GETDEL` 没有"比对不上就别删"这个选项，
+  它已经在自己的线程里，多绕一次 MQ 只增加延迟。
+- **Redis 令牌串错误时令牌也会被消费**。`GETDEL` 没有"比对不上就别删"这个选项，
   这是接受它的原子性所付的代价。key 由已认证的 userId 推出，攻击者只能作废自己的令牌。
 "# flash_sale_system" 

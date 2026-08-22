@@ -8,8 +8,10 @@ import com.fss.common.util.JsonUtil;
 import com.fss.domain.entity.MqMessage;
 import com.fss.domain.mapper.MqMessageMapper;
 import com.fss.domain.message.OrderCreateMessage;
+import com.fss.infra.alarm.AlarmService;
 import com.fss.infra.config.FssProperties;
 import com.fss.infra.lock.DistributedLock;
+import com.fss.infra.metrics.SeckillMetrics;
 import com.fss.infra.mq.MqTopics;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -54,6 +56,8 @@ public class MqResendJob {
     private final MqMessageMapper          mapper;
     private final ReliableMqProducer       producer;
     private final SeckillCompensateService compensateService;
+    private final SeckillMetrics           metrics;
+    private final AlarmService             alarm;
     private final FssProperties            props;
 
     @Scheduled(fixedDelayString = "${fss.job.mq-resend-delay-ms:30000}")
@@ -67,6 +71,7 @@ public class MqResendJob {
             TraceContext.set(null);
             try {
                 producer.doSend(rec);
+                metrics.mqResend(rec.getTopic());
                 sent++;
             } catch (Exception e) {
                 failed++;
@@ -103,12 +108,15 @@ public class MqResendJob {
      */
     private void onSendGiveUp(MqMessage rec) {
         mapper.markFailed(rec.getMsgId(), "超过最大重发次数 " + props.getMq().getMaxResend());
+        metrics.mqGiveUp(rec.getTopic());
 
         if (!MqTopics.ORDER_CREATE.equals(rec.getTopic())) {
             // 关单、回补类消息发不出去不涉及库存泄漏：关单有定时扫描兜底，
             // 回补有对账兜底。记 P2 日志等人看
             log.error("stage=MQ_GIVE_UP msgId={} topic={} bizKey={} 需人工处理",
                     rec.getMsgId(), rec.getTopic(), rec.getBizKey());
+            alarm.p2(AlarmService.Event.MQ_GIVE_UP, rec.getBizKey(),
+                    rec.getTopic() + " 投递放弃，有兜底路径");
             return;
         }
 
@@ -120,9 +128,13 @@ public class MqResendJob {
                     "订单消息投递失败，已退回");
             log.error("stage=MQ_GIVE_UP msgId={} requestNo={} autoRollback={} 已告警",
                     rec.getMsgId(), msg.getRequestNo(), done);
+            alarm.p2(AlarmService.Event.MQ_GIVE_UP, msg.getRequestNo(),
+                    "订单创建消息投递放弃，已自动回补=" + done);
         } catch (Exception e) {
             log.error("stage=MQ_GIVE_UP msgId={} bizKey={} result=ROLLBACK_FAILED 转人工",
                     rec.getMsgId(), rec.getBizKey(), e);
+            alarm.p1(AlarmService.Event.MQ_GIVE_UP, rec.getBizKey(),
+                    "订单创建消息投递放弃且回补失败，库存泄漏");
         } finally {
             TraceContext.clear();
         }

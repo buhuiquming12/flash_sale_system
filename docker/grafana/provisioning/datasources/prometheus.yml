@@ -1,0 +1,18 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    # uid 必须<b>写死</b>。不写时 Grafana 会生成一个随机 uid（形如 PBFA97CFB590B2093），
+    # 而看板 JSON 里的模板变量是按 uid 引用数据源的 ——
+    # 于是"活动"下拉框永远是空的，而面板本身因为走默认数据源反而是正常的。
+    # 症状就成了"图都有，就是筛不了活动"，很难联想到 uid 上。
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    # 容器间用服务名，不是 localhost —— Grafana 容器里的 localhost 是它自己
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # 与 prometheus.yml 的 scrape_interval 一致。不一致时 Grafana 会按自己的
+      # 间隔算 rate()，在数据点之间插值，画出来的曲线比真实值平滑
+      timeInterval: 15s
