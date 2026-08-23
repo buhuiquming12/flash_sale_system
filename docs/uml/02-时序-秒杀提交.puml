@@ -1,0 +1,177 @@
+@startuml 02-时序-秒杀提交
+' ============================================================================
+' 秒杀提交时序 —— 对应 docs/04-核心流程.md §2、SeckillServiceImpl#submit
+'
+' 这张图的重点不是"成功路径有几步"，而是**每一步失败时往哪边倒**：
+' 降级/限流拒绝在最前面（不消耗后面的资源），Lua 是唯一的资格分配入口，
+' 消息表写失败必须立即回补，Redis 结果不确定既不放行也不回补。
+' ============================================================================
+!pragma layout smetana
+
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontSize 12
+skinparam shadowing false
+skinparam sequenceMessageAlign first
+
+title 秒杀提交（同步返回「排队中」，全程不碰 MySQL 主链路）
+
+actor 客户端 as C
+box "接入层" #F5F5F5
+  participant "Nginx\nlimit_req" as N
+  participant "Sentinel" as S
+end box
+box "web 实例" #E3F2FD
+  participant "SeckillController" as Ctrl
+  participant "DegradeSwitch" as Deg
+  participant "SeckillTokenService" as Tok
+  participant "SeckillExecutor" as Exec
+  participant "ReliableMqProducer" as Prod
+end box
+database "Redis" as R
+database "MySQL" as DB
+queue "RocketMQ" as MQ
+
+C -> N : POST /api/seckill/{动态路径}
+N -> N : 单 IP 令牌桶
+alt 超过 IP 阈值
+  N --> C : **503**（连应用都不进）
+end
+N -> S : 转发
+S -> S : 接口 QPS + 熔断
+alt Sentinel 拦截
+  S --> C : **1004** 活动太火爆
+  note right of S
+    blockHandler 抛 BizException。
+    ""exceptionsToIgnore = BizException""
+    是关键：不写它「库存不足」会被
+    计入异常比例，几秒就熔断整个接口
+  end note
+end
+
+S -> Ctrl : submit(cmd, userId)
+activate Ctrl
+
+Ctrl -> Deg : seckillEnabled()
+note right of Deg
+  读**本地 volatile**，每秒从 Redis 刷一次。
+  放在最前面：降级的目的就是不消耗后面的资源
+end note
+alt 降级等级 ≥ 3
+  Deg --> Ctrl : false
+  Ctrl --> C : **1006** 服务降级中
+end
+
+Ctrl -> Ctrl : 校验参数（quantity 必须为 1）
+
+opt 携带秒杀令牌
+  Ctrl -> Tok : verifyAndConsume(token, userId, ...)
+  Tok -> R : **GETDEL** seckill:token:{userId}
+  note right of Tok
+    GETDEL 没有「比对不上就别删」的选项，
+    所以串错了令牌也会被消费 ——
+    这是接受它原子性的代价。
+    key 由已认证 userId 推出，
+    攻击者只能作废自己的令牌
+  end note
+  alt 令牌无效
+    Ctrl --> C : **3005** 令牌无效
+  end
+end
+
+Ctrl -> Ctrl : requestNo = 时间戳+机器号+**递增序列**
+note right of Ctrl
+  尾段用递增序列而非 6 位随机：
+  10000 QPS 下同秒同机 6 位随机数
+  碰撞率约 5%（生日问题），
+  碰撞表现为误拒或唯一键冲突
+end note
+
+group **唯一的资格分配入口**
+  Ctrl -> Exec : trySeckill(activityId, skuId, userId, qty, requestNo)
+  Exec -> R : EVALSHA **seckill.lua**
+  note right of R
+    一次调用做完五件事（全程原子）：
+    ① 活动状态 = 在售？
+    ② **Redis TIME** 判时间窗（不信应用时钟 → F14）
+    ③ HEXISTS bought → 一人一单
+    ④ DECRBY stock（不足则 -8 售罄快速失败）
+    ⑤ HSET req key + EXPIRE bought
+    —— req key 存在 ⟺ 库存已扣，
+    这条等价关系是 checkUncertain 的唯一判据
+  end note
+
+  alt Lua 返回 0（有资格）
+    R --> Exec : {ok, remainStock}
+  else 返回 -2 停售 / -8 售罄 / -3 已购买 / -4 未开始 / -5 已结束
+    R --> Exec : 拒绝码
+    Exec --> Ctrl : SeckillOutcome(未通过)
+    Ctrl -> Exec : writeResult(...) 写结论（脚本 D）
+    note right of Ctrl
+      这**不是回补** —— 这些请求根本没扣过库存。
+      写结论是因为客户端可能已在轮询，
+      给它明确答案比让它等到超时好。
+      脚本 D 的重建分支必须写 userId，
+      否则查询接口的归属校验过不了
+    end note
+    Ctrl -> DB : 落一条 t_seckill_request（失败只记日志）
+    Ctrl --> C : **2003/3002/3004** 明确的业务错误
+  else Redis 调用超时 / 连接失败
+    R --> Exec : 抛异常
+    Exec --> Ctrl : **UncertainResultException**
+    Ctrl -> R : ZADD seckill:uncertain（登记待确认）
+    note right of Ctrl
+      **既不能放行也不能回补**：不知道脚本执行了没有。
+      放行 = 可能超卖，回补 = 可能凭空造库存。
+      交给 UncertainCheckJob 事后判定（见 05 图）
+    end note
+    Ctrl --> C : **9001** 系统繁忙，请重试
+  end
+end
+
+group 可靠投递（决策 5：本地消息表）
+  Ctrl -> Prod : sendReliable(ORDER_CREATE, requestNo, msg)
+  Prod -> DB : INSERT t_mq_message (status=0 待发送)
+  alt 消息表都写不进去
+    DB --> Prod : 抛异常
+    Prod --> Ctrl : 异常
+    Ctrl -> Exec : **立即回补**（脚本 B, keepBought=false）
+    note right of Ctrl
+      投递意图彻底没能落盘 ——
+      没有任何后续机制会为这个用户建订单。
+      不回补这份库存就永久泄漏：
+      1000 库存最后只卖 997 件，且账面「已售罄」
+    end note
+    Ctrl --> C : **9001** 系统繁忙
+  end
+  Prod -> MQ : syncSend
+  alt send 失败
+    MQ --> Prod : 超时/异常
+    Prod -> Prod : **吞掉异常**，留给 MqResendJob
+    note right of Prod
+      这里**不能**回补：消息行已落盘，
+      重发任务会接手。回补了才是真丢单
+    end note
+  else
+    Prod -> DB : UPDATE status=1 已发送
+  end
+end
+
+Ctrl -> Ctrl : metrics.seckillRequest(qualified)
+Ctrl --> C : **200** {status:0, requestNo,\nremainStock, **pollAfterMs**}
+deactivate Ctrl
+
+note over C
+  remainStock 报的是 **Redis** 的值而非 DB：
+  Redis 才是资格分配的权威，
+  两者差值正是「排队中」的量。
+
+  pollAfterMs 由降级开关下发（300ms → 2000ms），
+  Level 2 起把结果接口压力降一个数量级，**不用发版**
+end note
+
+C -> C : 按 pollAfterMs 轮询结果接口
+note right of C
+  订单还没创建 —— 见 03-时序-异步下单
+end note
+
+@enduml

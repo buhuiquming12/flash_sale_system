@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  S3 秒杀提交（已售罄）—— 文档目标：10000 并发 / 1 min / P99 < 30ms
+
+  **单独测这个场景的意义**：验证售罄快速失败真的短路了。
+  脚本 A 在预扣归零时把 goodsKey 的 status 改成 2，下一批请求在**第二步**
+  （HMGET 之后的整数比较）就返回 -8，脚本操作数从 5 降到 2 ——
+  EXISTS reqKey、EXISTS goodsKey、HMGET、比较、返回，
+  不再有 TIME、HGET bought、GET stock、DECRBY、HINCRBY、EXPIRE、HSET、EXPIRE。
+
+  所以 S3 的 P99 应当**显著低于** S2。如果两者差不多，说明 status=2 的短路没生效
+  （比如预热覆盖元数据时把 status 写回了 1），而这种失效不会有任何报错——
+  只是 Redis CPU 在售罄后依然居高不下。
+
+  与 S2 的两处不同：
+  ① CSV 用 recycle=true。售罄分支在**一人一单检查之前**就返回了，
+     同一用户重复请求得到的仍然是 -8，所以可以复用用户表跑满时长。
+     （这也是为什么 S3 能用 duration 而 S2 不能。）
+  ② 用 duration 跑满时长而不是「用户表用完就停」。
+
+  前置条件：活动库存必须已售罄（status=2）。驱动脚本在 S2 之后跑 S3，
+  或用 -Jactivity 指向一个专门造的售罄活动。
+
+  参数：-Jhost -Jport -Jactivity -Jsku -Jthreads -Jduration -Jrampup -Jusers_csv
+-->
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="S3 秒杀提交（已售罄）" enabled="true">
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="UDV" enabled="true">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="HOST" elementType="Argument">
+            <stringProp name="Argument.name">HOST</stringProp>
+            <stringProp name="Argument.value">${__P(host,127.0.0.1)}</stringProp>
+          </elementProp>
+          <elementProp name="PORT" elementType="Argument">
+            <stringProp name="Argument.name">PORT</stringProp>
+            <stringProp name="Argument.value">${__P(port,8080)}</stringProp>
+          </elementProp>
+          <elementProp name="ACTIVITY" elementType="Argument">
+            <stringProp name="Argument.name">ACTIVITY</stringProp>
+            <stringProp name="Argument.value">${__P(activity,1)}</stringProp>
+          </elementProp>
+          <elementProp name="SKU" elementType="Argument">
+            <stringProp name="Argument.name">SKU</stringProp>
+            <stringProp name="Argument.value">${__P(sku,1)}</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+    </TestPlan>
+    <hashTree>
+
+      <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP 默认值" enabled="true">
+        <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+        <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+        <stringProp name="HTTPSampler.connect_timeout">3000</stringProp>
+        <stringProp name="HTTPSampler.response_timeout">10000</stringProp>
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+          <collectionProp name="Arguments.arguments"/>
+        </elementProp>
+      </ConfigTestElement>
+      <hashTree/>
+
+      <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="通用头" enabled="true">
+        <collectionProp name="HeaderManager.headers">
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">Content-Type</stringProp>
+            <stringProp name="Header.value">application/json;charset=UTF-8</stringProp>
+          </elementProp>
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">Authorization</stringProp>
+            <stringProp name="Header.value">Bearer ${TOKEN}</stringProp>
+          </elementProp>
+        </collectionProp>
+      </HeaderManager>
+      <hashTree/>
+
+      <SetupThreadGroup guiclass="SetupThreadGroupGui" testclass="SetupThreadGroup" testname="setUp" enabled="true">
+        <intProp name="ThreadGroup.num_threads">1</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">1</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </SetupThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="初始化计数器" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">props.put('bizCodes3', new java.util.concurrent.ConcurrentHashMap())</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="售罄提交" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">${__P(threads,500)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${__P(rampup,5)}</stringProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.duration">${__P(duration,60)}</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">
+          <stringProp name="LoopController.loops">-1</stringProp>
+          <boolProp name="LoopController.continue_forever">true</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+
+        <CSVDataSet guiclass="TestBeanGUI" testclass="CSVDataSet" testname="users.csv（可循环）" enabled="true">
+          <stringProp name="filename">${__P(users_csv,users.csv)}</stringProp>
+          <stringProp name="fileEncoding">UTF-8</stringProp>
+          <stringProp name="variableNames">UNAME,USERID,TOKEN</stringProp>
+          <boolProp name="ignoreFirstLine">false</boolProp>
+          <stringProp name="delimiter">,</stringProp>
+          <boolProp name="quotedData">false</boolProp>
+          <!-- 与 S2 不同：这里 recycle=true。售罄分支在一人一单检查**之前**返回，
+               复用用户不改变被测路径 -->
+          <boolProp name="recycle">true</boolProp>
+          <boolProp name="stopThread">false</boolProp>
+          <stringProp name="shareMode">shareMode.all</stringProp>
+        </CSVDataSet>
+        <hashTree/>
+
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="POST /api/seckill/do（售罄）" enabled="true">
+          <stringProp name="HTTPSampler.path">/api/seckill/do</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.value">{"activityId":${ACTIVITY},"skuId":${SKU},"quantity":1}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <JSR223PostProcessor guiclass="TestBeanGUI" testclass="JSR223PostProcessor" testname="分类业务码" enabled="true">
+            <stringProp name="scriptLanguage">groovy</stringProp>
+            <stringProp name="script">import groovy.json.JsonSlurper
+def counts = props.get('bizCodes3')
+if (prev.getResponseCode() != '200') {
+    counts.merge('http_' + prev.getResponseCode(), 1L, { a, b -&gt; a + b }); return
+}
+try {
+    def r = new JsonSlurper().parseText(prev.getResponseDataAsString())
+    counts.merge('code_' + r.code, 1L, { a, b -&gt; a + b })
+} catch (e) {
+    counts.merge('unparseable', 1L, { a, b -&gt; a + b })
+}</stringProp>
+          </JSR223PostProcessor>
+          <hashTree/>
+        </hashTree>
+
+      </hashTree>
+
+      <PostThreadGroup guiclass="PostThreadGroupGui" testclass="PostThreadGroup" testname="tearDown" enabled="true">
+        <intProp name="ThreadGroup.num_threads">1</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">1</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </PostThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="业务码分布" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">def counts = props.get('bizCodes3')
+def sb = new StringBuilder('\n===== S3 业务码分布 =====\n')
+counts.sort { it.key }.each { k, v -&gt; sb.append(String.format('%-18s %d%n', k, v)) }
+sb.append('  期望绝大多数是 code_3001（售罄快速失败）\n')
+log.info(sb.toString())</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>

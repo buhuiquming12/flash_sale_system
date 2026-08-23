@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  S2 秒杀提交（有库存）—— 文档目标：10000 并发 / 30 s / P99 < 100ms / 无超卖
+
+  这是全套里最重要也最容易写错的一个场景。三个关键点：
+
+  ① **每个请求必须是不同用户。** 一人一单由 Lua 的 HEXISTS bought 保证，
+     同一用户第二次提交直接返回 3002。所以 CSV 配成
+     sharing=All threads + recycle=false + stopThread=true：
+     全局共享一份用户表，每行只被消费一次，用完就停。
+     配成 recycle=true 的话第二轮开始全是 3002 ——
+     测出来的 P99 很漂亮（快速拒绝当然快），但测的是拒绝路径。
+
+  ② **不断言 code=0。** 秒杀提交的正常结果里就包含业务失败：
+     库存卖光后是 3001（售罄 -8 与库存不足 -6 都映射到 STOCK_NOT_ENOUGH）。
+     把它们算成 error 会让错误率变成「没抢到的比例」，那不是系统错误率。
+     这里只断言 HTTP 200 + 响应可解析，业务码分布由 JSR223 分类统计到 props 里，跑完打印。
+
+  ③ 用固定路径 /api/seckill/do 而不是动态路径。走动态路径要先调 /token，
+     那样一半的压力打在令牌接口上，测的是两个接口的混合 ——
+     SeckillController 里保留这个入口正是为了压测（生产在网关层屏蔽）。
+
+  参数：-Jhost -Jport -Jactivity -Jsku -Jthreads -Jrampup -Jusers_csv -Jreq_out
+-->
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="S2 秒杀提交（有库存）" enabled="true">
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="UDV" enabled="true">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="HOST" elementType="Argument">
+            <stringProp name="Argument.name">HOST</stringProp>
+            <stringProp name="Argument.value">${__P(host,127.0.0.1)}</stringProp>
+          </elementProp>
+          <elementProp name="PORT" elementType="Argument">
+            <stringProp name="Argument.name">PORT</stringProp>
+            <stringProp name="Argument.value">${__P(port,8080)}</stringProp>
+          </elementProp>
+          <elementProp name="ACTIVITY" elementType="Argument">
+            <stringProp name="Argument.name">ACTIVITY</stringProp>
+            <stringProp name="Argument.value">${__P(activity,1)}</stringProp>
+          </elementProp>
+          <elementProp name="SKU" elementType="Argument">
+            <stringProp name="Argument.name">SKU</stringProp>
+            <stringProp name="Argument.value">${__P(sku,1)}</stringProp>
+          </elementProp>
+          <elementProp name="REQ_OUT" elementType="Argument">
+            <stringProp name="Argument.name">REQ_OUT</stringProp>
+            <stringProp name="Argument.value">${__P(req_out,requests.csv)}</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+    </TestPlan>
+    <hashTree>
+
+      <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP 默认值" enabled="true">
+        <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+        <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+        <stringProp name="HTTPSampler.connect_timeout">3000</stringProp>
+        <stringProp name="HTTPSampler.response_timeout">15000</stringProp>
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+          <collectionProp name="Arguments.arguments"/>
+        </elementProp>
+      </ConfigTestElement>
+      <hashTree/>
+
+      <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="通用头" enabled="true">
+        <collectionProp name="HeaderManager.headers">
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">Content-Type</stringProp>
+            <stringProp name="Header.value">application/json;charset=UTF-8</stringProp>
+          </elementProp>
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">Authorization</stringProp>
+            <stringProp name="Header.value">Bearer ${TOKEN}</stringProp>
+          </elementProp>
+        </collectionProp>
+      </HeaderManager>
+      <hashTree/>
+
+      <SetupThreadGroup guiclass="SetupThreadGroupGui" testclass="SetupThreadGroup" testname="setUp 初始化统计" enabled="true">
+        <intProp name="ThreadGroup.num_threads">1</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">1</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </SetupThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="清空 requests.csv + 计数器" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">new File(vars.get('REQ_OUT')).text = ''
+props.put('bizCodes', new java.util.concurrent.ConcurrentHashMap())
+log.info('S2 开始，requestNo 将写入 ' + vars.get('REQ_OUT'))</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="秒杀提交" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">${__P(threads,500)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${__P(rampup,5)}</stringProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <!-- 不设 duration：用户表用完就结束（stopThread=true）。
+             这正是「开抢瞬间」的形态——N 个人各抢一次 -->
+        <boolProp name="ThreadGroup.scheduler">false</boolProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">
+          <stringProp name="LoopController.loops">-1</stringProp>
+          <boolProp name="LoopController.continue_forever">true</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+
+        <CSVDataSet guiclass="TestBeanGUI" testclass="CSVDataSet" testname="users.csv（每行只用一次）" enabled="true">
+          <stringProp name="filename">${__P(users_csv,users.csv)}</stringProp>
+          <stringProp name="fileEncoding">UTF-8</stringProp>
+          <stringProp name="variableNames">UNAME,USERID,TOKEN</stringProp>
+          <boolProp name="ignoreFirstLine">false</boolProp>
+          <stringProp name="delimiter">,</stringProp>
+          <boolProp name="quotedData">false</boolProp>
+          <!-- recycle=false + stopThread=true：每行只消费一次，读完即停。
+               一人一单决定了这里不能 recycle -->
+          <boolProp name="recycle">false</boolProp>
+          <boolProp name="stopThread">true</boolProp>
+          <stringProp name="shareMode">shareMode.all</stringProp>
+        </CSVDataSet>
+        <hashTree/>
+
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="POST /api/seckill/do" enabled="true">
+          <stringProp name="HTTPSampler.path">/api/seckill/do</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.value">{"activityId":${ACTIVITY},"skuId":${SKU},"quantity":1}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <JSR223PostProcessor guiclass="TestBeanGUI" testclass="JSR223PostProcessor" testname="分类业务码 + 记录 requestNo" enabled="true">
+            <stringProp name="scriptLanguage">groovy</stringProp>
+            <stringProp name="script">import groovy.json.JsonSlurper
+
+def counts = props.get('bizCodes')
+def bump = { k -&gt; counts.merge(k, 1L, { a, b -&gt; a + b }) }
+
+if (prev.getResponseCode() != '200') {
+    bump('http_' + prev.getResponseCode())
+    return
+}
+def body = prev.getResponseDataAsString()
+def r
+try { r = new JsonSlurper().parseText(body) } catch (e) { bump('unparseable'); return }
+
+bump('code_' + r.code)
+
+// 只有排队中（code=0）的请求有 requestNo，供 S4 结果轮询使用。
+// 业务失败的请求也有 requestNo，但它们的结论已经是终态，轮询没有意义
+if (r.code == 0 &amp;&amp; r.data?.requestNo) {
+    def f = new File(vars.get('REQ_OUT'))
+    synchronized (f.getCanonicalPath().intern()) {
+        f.append(r.data.requestNo + ',' + vars.get('TOKEN') + '\n', 'UTF-8')
+    }
+}</stringProp>
+          </JSR223PostProcessor>
+          <hashTree/>
+        </hashTree>
+
+      </hashTree>
+
+      <PostThreadGroup guiclass="PostThreadGroupGui" testclass="PostThreadGroup" testname="tearDown 打印业务码分布" enabled="true">
+        <intProp name="ThreadGroup.num_threads">1</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">1</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </PostThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="业务码分布" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">def counts = props.get('bizCodes')
+def sb = new StringBuilder('\n===== S2 业务码分布（不是错误率）=====\n')
+counts.sort { it.key }.each { k, v -&gt; sb.append(String.format('%-18s %d%n', k, v)) }
+sb.append('  code_0=排队中  code_2003=活动已结束  code_3002=已购买过\n')
+sb.append('  code_3001=库存不足/已售罄  code_1006=服务降级中  code_1004=限流\n')
+log.info(sb.toString())
+// 同时落一份文件，驱动脚本会把它并进报告
+new File(vars.get('REQ_OUT') + '.bizcodes').text =
+        counts.sort { it.key }.collect { k, v -&gt; k + ',' + v }.join('\n') + '\n'</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>

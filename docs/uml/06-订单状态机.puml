@@ -1,0 +1,65 @@
+@startuml 06-订单状态机
+' ============================================================================
+' 订单状态机 —— 对应 OrderStateMachine，与 OrderStateMachineTest 穷举的 6×6 一致
+' 7 条合法迁移、29 条拒绝。
+' ============================================================================
+!pragma layout smetana
+
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontSize 12
+skinparam shadowing false
+skinparam state {
+  BorderColor #78909C
+  BackgroundColor #FFFFFF
+  FontSize 13
+}
+
+title 订单状态机（7 条合法迁移，其余 29 条一律拒绝）
+
+state "待支付\nPENDING_PAY = 0" as P #E3F2FD
+state "已支付\nPAID = 1" as PAID #E8F5E9
+state "已完成\nFINISHED = 3" as F #E8F5E9
+state "退款中\nREFUNDING = 4" as RING #FFF3E0
+state "已取消\nCANCELLED = 2" as C #FFEBEE
+state "已退款\nREFUNDED = 5" as RED #FFEBEE
+
+[*] --> P : 消费端建单\n（expire_time = 创建 + 15min）
+
+P     --> PAID : 支付成功回调\n**locked → sold**
+P     --> C    : 超时关单 / 主动取消\n**locked → available**
+PAID  --> F    : 发货完成
+PAID  --> RING : 申请退款
+F     --> RING : 售后退款
+RING  --> RED  : 退款完成
+RING  --> PAID : **退款被拒**（退回已支付）
+
+C     --> [*]  : **终态，无出边**
+RED   --> [*]  : **终态，无出边**
+
+note right of C
+  **CANCELLED 是终态，没有回头路。**
+  这决定了两件事：
+  · 支付与关单竞态输给关单时只能**退款**，
+    不能把订单拉回「已支付」（F9）
+  · 支付对账 D 类（支付成功 + 订单已取消）
+    绝不能补推订单 —— 关单已经把库存
+    还给别人了，补推等于超卖
+end note
+
+note left of P
+  每次迁移都是**状态条件更新**
+  ""UPDATE ... WHERE status = <from>""
+  影响 0 行即视为「别人已处理」，
+  这就是幂等 L3。
+
+  竞态双方各自条件更新，
+  数据库保证恰好一方成功（C10 ×30 轮验证）
+end note
+
+note bottom of RING
+  退款态目前由 RefundService 直接
+  从 PAID 置 REFUNDED（模拟渠道即时到账），
+  REFUNDING 为真实渠道预留
+end note
+
+@enduml

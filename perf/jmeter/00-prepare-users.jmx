@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  00-prepare-users.jmx —— 批量注册用户并登录，把 JWT 写进 users.csv
+
+  为什么必须先做这一步：**一人一单**。同一个用户第二次提交秒杀会被 Lua 的
+  HEXISTS bought 拦掉返回 3002，于是压测测的是「已购买」这条快速拒绝路径，
+  而不是真正的资格分配路径。要测「有库存时的提交」，每个请求必须是不同用户。
+
+  产物 users.csv 每行：username,userId,token
+  用 -Jusers 控制数量（默认 2000）。跑一次即可，除非 down -v 清了 MySQL。
+
+  参数：
+    -Jhost -Jport      被测地址
+    -Jusers            注册多少个用户
+    -Jprefix           用户名前缀（换前缀可避免与上次的用户冲突）
+    -Jout              输出 CSV 路径
+-->
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="00 准备压测用户" enabled="true">
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="HOST" elementType="Argument">
+            <stringProp name="Argument.name">HOST</stringProp>
+            <stringProp name="Argument.value">${__P(host,127.0.0.1)}</stringProp>
+          </elementProp>
+          <elementProp name="PORT" elementType="Argument">
+            <stringProp name="Argument.name">PORT</stringProp>
+            <stringProp name="Argument.value">${__P(port,8080)}</stringProp>
+          </elementProp>
+          <elementProp name="USERS" elementType="Argument">
+            <stringProp name="Argument.name">USERS</stringProp>
+            <stringProp name="Argument.value">${__P(users,2000)}</stringProp>
+          </elementProp>
+          <elementProp name="PREFIX" elementType="Argument">
+            <stringProp name="Argument.name">PREFIX</stringProp>
+            <stringProp name="Argument.value">${__P(prefix,perf)}</stringProp>
+          </elementProp>
+          <elementProp name="OUT" elementType="Argument">
+            <stringProp name="Argument.name">OUT</stringProp>
+            <stringProp name="Argument.value">${__P(out,users.csv)}</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+    </TestPlan>
+    <hashTree>
+
+      <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP 默认值" enabled="true">
+        <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+        <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+        <stringProp name="HTTPSampler.connect_timeout">5000</stringProp>
+        <stringProp name="HTTPSampler.response_timeout">20000</stringProp>
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+          <collectionProp name="Arguments.arguments"/>
+        </elementProp>
+      </ConfigTestElement>
+      <hashTree/>
+
+      <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="JSON 头" enabled="true">
+        <collectionProp name="HeaderManager.headers">
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">Content-Type</stringProp>
+            <stringProp name="Header.value">application/json;charset=UTF-8</stringProp>
+          </elementProp>
+        </collectionProp>
+      </HeaderManager>
+      <hashTree/>
+
+      <!-- 先清空输出文件，避免多次运行时旧 token 混进来（过期 token 会让主压测全 401） -->
+      <SetupThreadGroup guiclass="SetupThreadGroupGui" testclass="SetupThreadGroup" testname="setUp 清空 CSV" enabled="true">
+        <intProp name="ThreadGroup.num_threads">1</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">1</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </SetupThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="truncate users.csv" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">new File(vars.get('OUT')).text = ''
+log.info('users.csv 已清空: ' + vars.get('OUT'))</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="注册并登录" enabled="true">
+        <!-- 50 个线程并发注册。注册要做 BCrypt（故意慢），单线程跑 2000 个要好几分钟 -->
+        <intProp name="ThreadGroup.num_threads">24</intProp>
+        <intProp name="ThreadGroup.ramp_time">5</intProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">
+          <stringProp name="LoopController.loops">${__groovy(Math.ceil(Integer.parseInt(vars.get('USERS')) / 24) as int)}</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+
+        <!-- 用「线程号 + 迭代号」拼唯一用户名，不用随机数：随机会碰撞，
+             碰撞后注册失败那一格就没有用户，主压测读到空行会 401 -->
+        <JSR223PreProcessor guiclass="TestBeanGUI" testclass="JSR223PreProcessor" testname="生成用户名" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">int tn = ctx.getThreadNum()            // 0-based
+int it = vars.getIteration()          // 1-based
+vars.put('UNAME', vars.get('PREFIX') + '_' + tn + '_' + it)</stringProp>
+        </JSR223PreProcessor>
+        <hashTree/>
+
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="POST /api/user/register" enabled="true">
+          <stringProp name="HTTPSampler.path">/api/user/register</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.value">{"username":"${UNAME}","password":"Passw0rd1"}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree/>
+
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="POST /api/user/login" enabled="true">
+          <stringProp name="HTTPSampler.path">/api/user/login</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.value">{"username":"${UNAME}","password":"Passw0rd1"}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <JSR223PostProcessor guiclass="TestBeanGUI" testclass="JSR223PostProcessor" testname="抽取 token 追加到 CSV" enabled="true">
+            <stringProp name="scriptLanguage">groovy</stringProp>
+            <stringProp name="script">import groovy.json.JsonSlurper
+
+if (prev.getResponseCode() != '200') {
+    log.warn('登录失败 ' + vars.get('UNAME') + ' code=' + prev.getResponseCode())
+    return
+}
+def r = new JsonSlurper().parseText(prev.getResponseDataAsString())
+if (r.code != 0 || r.data == null) {
+    log.warn('登录返回异常 ' + vars.get('UNAME') + ': ' + prev.getResponseDataAsString())
+    return
+}
+def token  = r.data.token
+def userId = r.data.userId ?: (r.data.user?.id ?: '')
+if (!token) {
+    log.warn('响应里没有 token: ' + prev.getResponseDataAsString())
+    return
+}
+
+// 多线程追加同一个文件：按规范化路径 intern 后加锁。
+// 不加锁时 Windows 上会出现半行（两个线程的字节交错），
+// 而半行在主压测里表现为「token 少了几个字符 → 401」，很难联想到准备阶段
+def f = new File(vars.get('OUT'))
+synchronized (f.getCanonicalPath().intern()) {
+    f.append(vars.get('UNAME') + ',' + userId + ',' + token + '\n', 'UTF-8')
+}</stringProp>
+          </JSR223PostProcessor>
+          <hashTree/>
+        </hashTree>
+
+      </hashTree>
+
+      <!-- 只汇总，不写明细：准备阶段的逐条结果没有价值 -->
+      <ResultCollector guiclass="SummaryReport" testclass="ResultCollector" testname="汇总" enabled="true">
+        <boolProp name="ResultCollector.error_logging">true</boolProp>
+        <objProp>
+          <name>saveConfig</name>
+          <value class="SampleSaveConfiguration">
+            <time>true</time><latency>true</latency><timestamp>true</timestamp>
+            <success>true</success><label>true</label><code>true</code>
+            <threadCounts>true</threadCounts>
+            <bytes>false</bytes><url>false</url><message>false</message>
+            <responseData>false</responseData><samplerData>false</samplerData>
+            <assertions>false</assertions><subresults>false</subresults>
+            <fieldNames>true</fieldNames>
+          </value>
+        </objProp>
+        <stringProp name="filename"></stringProp>
+      </ResultCollector>
+      <hashTree/>
+
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>

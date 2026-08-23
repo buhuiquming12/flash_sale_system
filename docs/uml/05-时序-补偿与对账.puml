@@ -1,0 +1,221 @@
+@startuml 05-时序-补偿与对账
+' ============================================================================
+' 补偿回补 + 对账收敛时序 —— 阶段四的核心
+'
+' 这张图回答的是「上面所有机制都失效了怎么办」：
+' checkUncertain 判定不确定结果、三类对账发现差异、只在严格前提下自动修。
+' ============================================================================
+!pragma layout smetana
+
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontSize 12
+skinparam shadowing false
+
+title 补偿回补与对账收敛（阶段四：差异能被发现并收敛）
+
+box "job 实例（全部带 Redisson 锁）" #FFF3E0
+  participant "UncertainCheckJob\n10s" as UC
+  participant "QualificationReconciler\n每 1 分钟" as QR
+  participant "StockReconciler\n每 5 分钟" as SR
+  participant "PaymentReconciler\n每 10 分钟" as PR
+  participant "DegradeMonitorJob\n15s" as DM
+end box
+database "Redis" as R
+database "MySQL" as DB
+queue "RocketMQ" as MQ
+participant "AlarmService" as AL
+
+== ① checkUncertain：Redis 结果不确定 ==
+
+note over UC
+  判据只有一条，但它足够 ——
+  脚本 A 的原子性保证「预扣库存」与「写 req key」
+  要么都发生要么都不发生：
+
+  **EXISTS seckill:req:{a:s}:<requestNo> == 1 ⟺ 库存已扣**
+end note
+
+UC -> R : ZRANGEBYSCORE seckill:uncertain\n0 → (now - **静置 5s**)
+note right of UC
+  **不能立刻判定**：超时那一刻脚本可能**正在**执行。
+  少了静置窗口，「刚超时就判没执行」
+  会把一份已扣的库存留成永久泄漏。
+
+  用 ZSet 而非 List（与 docs/04 的偏差）：
+  LPOP 取出即出队，处理中崩了记录就消失 ——
+  而它正是「不知道扣没扣」的唯一线索；
+  List 也没有时间维度，做不了这个静置窗口
+end note
+
+loop 每条待确认记录
+  UC -> R : EXISTS req key
+  alt 存在 → 已扣
+    UC -> MQ : **补发 ORDER_CREATE（同一个 requestNo）**
+    note right of UC
+      换新 requestNo 会绕过全部幂等层：
+      req key 上是旧号的预扣，新消息建出另一条订单 →
+      一次预扣变成两张单，而 uk_request_no 拦不住
+      （它们的 request_no 本来就不同）
+    end note
+    UC -> R : ZREM（按**原始 JSON 串**）
+    note right of UC
+      重新序列化可能不是字节级相同 → ZREM 静默删 0 条
+    end note
+  else 不存在 → 没扣
+    UC -> R : ZREM（什么都不用做）
+  else EXISTS 本身失败
+    alt 未超保留期（10 分钟）
+      UC -> UC : **保留**，下轮再试
+      note right of UC
+        删掉就丢了唯一线索。判定与补发都是幂等的，重试无害
+      end note
+    else 超过保留期
+      UC -> DB : 落资格类对账任务（**需人工**）
+      UC -> AL : P2 告警
+      note right of UC
+        **绝不自动回补**：处境恰好是「不知道扣没扣」，
+        回补一份没扣过的库存 = 凭空造库存 = 直接超卖。
+        少卖能人工修，超卖要赔钱
+      end note
+    end
+  end
+end
+
+== ② 资格对账：孤儿预扣（每分钟，用户正在等） ==
+
+QR -> R : SCAN seckill:req:{a:s}:*
+QR -> QR : 只看 status=0（排队中）\n且早于 orphan-after 的
+QR -> DB : **先查 selectByRequestNo**
+note right of QR
+  必须先查订单。回补一个**有效订单**的库存就是超卖 ——
+  这一步在五分支判断之前
+end note
+alt 订单已存在
+  QR -> R : 只补写结论（脚本 D）
+  note right of QR
+    订单在、结论丢了。用户卡在「排队中」但单是好的
+  end note
+else 订单不存在 → 查本地消息表
+  note over QR, DB
+    |= t_mq_message 状态 |= 含义 |= 处置 |
+    | 无记录 | 预扣了但消息压根没登记 | 回补 |
+    | 0 待发送 | 重发任务会处理 | **等**，不动 |
+    | 1 已发送 | 可能在重试中 | 连续 N 轮仍如此才回补 |
+    | 2 已消费 | 消费成功但订单没了？ | P1 告警，人工 |
+    | 3 发送失败 | 确定发不出去 | 回补 |
+  end note
+  QR -> R : INCR reconcile:orphan:count:{requestNo}（TTL 1h）
+  note right of QR
+    轮次计数放 **Redis** 而非内存：
+    内存计数一重启就归零，「连续 3 轮」永远达不到
+  end note
+  QR -> R : 满足条件才回补（脚本 B）
+end
+
+== ③ 库存对账：三条独立等式（每 5 分钟，最贵） ==
+
+note over SR
+  **与 docs/05 §9.2 的偏差**：文档写
+  ""available + occupied + queueing == total""，
+  而 queueing 是「Redis 已预扣但**还没落库**」的量 ——
+  它根本不在 DB 里。加进 DB 的等式，只要有排队请求
+  dbOk 就恒为假 → 每轮都判「DB 漂移」→ 自动修正永不触发
+  （它的前提正是 dbOk）→ 每 5 分钟刷一条「需人工」。
+  症状：**对账一直报差异，但库存其实是对的**
+end note
+
+SR -> DB : 读 t_seckill_goods
+SR -> R : GET stock
+SR -> R : SCAN 数 status=0 的 req key → queueing
+alt SCAN 失败
+  SR -> SR : queueing = **-1** → 跳过等式③
+  note right of SR
+    当成 0 会凭空造出一个「差异」
+  end note
+end
+
+note over SR, DB
+  |= # |= 等式 |= 破了说明 |
+  | ① | total == available + locked + sold | 商品表自身不自洽 |
+  | ② | locked + sold == Σ 未取消订单 qty | 商品表与订单表不吻合 |
+  | ③ | redisStock == available - queueing | Redis 与 DB 漂移 |
+end note
+
+alt redisStock > available
+  SR -> AL : **P1 告警，绝不自动修**
+  note right of SR
+    Redis 比 DB 多 = 可能已经超卖。
+    覆盖它会把证据也擦掉
+  end note
+else 差异 且 **DB 自洽 且 queueing == 0**
+  SR -> R : SET stock = available（自动修正）
+  SR -> DB : 落任务（自动修复成功）
+else 其他
+  SR -> DB : 落任务（需人工）
+end
+SR -> SR : **推送**库存仪表（capacity/remain/db_available/queueing）
+note right of SR
+  推送而非回调采样：回调式让每次抓取产生 40 次 Redis 查询，
+  且 Redis 一慢整个端点超时 →
+  连「Redis 慢了」这条曲线自己都断掉
+end note
+
+== ④ 支付对账：四类，只有一类能自动修（每 10 分钟） ==
+
+note over PR, DB
+  |= 类 |= 差异 |= 处置 |
+  | **A** | 支付成功但订单仍**待支付**（o.status=0） | 自动修：markPaid + **locked→sold 同事务** |
+  | B | 订单已支付但无成功流水 | 人工 |
+  | C | 金额不一致 | 人工，**资损** |
+  | **D** | 支付成功但订单**已取消** | 人工 + 退款，**绝不补推** |
+end note
+
+note over PR
+  **与 docs/05 §9.3 的偏差**：A 类 SQL 必须限定 ""o.status = 0""。
+  文档写 ""NOT IN (1,3,4,5)"" 把 status=2（已取消）也捞进来了 ——
+  那是 D 类，处置方式**正好相反**。
+  两类混在一条查询里，自动修复会把**资损事件**「修」成**超卖事件**
+  （关单已经把库存还给别人了，补推等于超卖）。
+
+  A 类补推还**必须连 locked→sold 一起做**，
+  只改订单状态会让 locked 永久留一份已卖出的量 ——
+  而这种不一致上面三条等式**全都发现不了**
+end note
+
+PR -> DB : 四条差异查询（paymentDiffAfter 给回调延迟留窗口）
+alt A 类
+  PR -> DB : PaymentFixer.fixPaidOrderPending()
+  note right of PR
+    单独一个 Bean：""@Transactional"" 自调用**不走代理**，
+    同类内调用等于没有事务
+  end note
+else D 类
+  PR -> DB : RefundService.refund()
+  PR -> AL : **P1** PAY_CANCEL_RACE
+end
+
+== ⑤ 自动降级（15s） ==
+
+DM -> MQ : 查消费积压
+DM -> DM : 查 Hikari threadsAwaitingConnection
+note over DM
+  **目标等级 = 各条件的最大值**，不是「最后触发的那个」。
+  顺序覆盖会出现：积压超阈值判 Level 3，
+  接着「连接池正常」把它写回 0 →
+  秒杀在积压 8 万条时重新开闸。
+
+  取最大值顺带解决自动恢复：每轮从 0 重算，
+  条件全退回结果自然是 0，不必记「是谁触发的」。
+  采不到数据的信号**不参与计算**而非当成 0 ——
+  broker 挂了正是最该降级的时候
+end note
+DM -> R : SET degrade:level:**auto**（TTL 300s）
+note right of DM
+  两个 key，生效等级 = max(人工, 自动)：
+  · 人工 key **不带 TTL**（人的决定不该悄悄失效）
+  · 自动 key **带 TTL**（写入者崩溃后没人负责删它）
+  所以自动机制只能**收紧**，永远盖不过人的决定
+end note
+DM -> AL : 等级变化时告警
+
+@enduml

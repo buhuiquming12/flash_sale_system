@@ -1,0 +1,30 @@
+# 演练结束时的系统终态（2026-08-23 16:56:24）
+
+## 告警指标
+fss_alarm_total{application="fss",event="MQ_DLQ",severity="P2"} 1.0
+fss_alarm_total{application="fss",event="REDIS_UNCERTAIN",severity="P2"} 3.0
+fss_alarm_total{application="fss",event="STOCK_DRIFT",severity="P1"} 1.0
+fss_alarm_total{application="fss",event="STOCK_REDIS_GT_DB",severity="P1"} 1.0
+
+## 补偿与死信
+fss_dlq_total{application="fss",topic="FSS_ORDER_CREATE"} 1.0
+fss_redis_uncertain_total{application="fss",stage="seckill"} 3.0
+fss_stock_rollback_total{activity="5",application="fss",sku="3",type="release"} 365.0
+fss_stock_rollback_total{activity="6",application="fss",sku="4",type="release"} 1.0
+fss_stock_rollback_total{activity="7",application="fss",sku="9",type="compensate"} 4.0
+fss_stock_rollback_total{activity="7",application="fss",sku="9",type="release"} 8.0
+
+## 各活动库存账目
+
+## 消息表
+topic	status	n
+FSS_ORDER_CLOSE	1	4
+FSS_ORDER_CLOSE	2	6864
+FSS_ORDER_CREATE	2	6870
+FSS_STOCK_RELEASE	1	7
+FSS_STOCK_RELEASE	2	6860
+
+## 对账任务
+id	task_type	biz_no	status	result
+1	2	5:3	2	Redis ???? DB ??????????????????????? Redis key ????????
+2	1	NULL	2	NULL

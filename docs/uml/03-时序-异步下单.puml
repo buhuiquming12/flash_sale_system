@@ -1,0 +1,177 @@
+@startuml 03-时序-异步下单
+' ============================================================================
+' 异步下单时序 —— OrderCreateListener + OrderCreateService#handle
+'
+' 重点：幂等三层各拦什么、消费端唯一的判断是"抛异常还是补偿并 ACK"、
+' 为什么关单消息必须在同事务内登记、为什么结论回写必须在提交之后。
+' ============================================================================
+!pragma layout smetana
+
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontSize 12
+skinparam shadowing false
+
+title 异步下单（订单真正诞生的地方；落库逻辑与阶段一同一个方法）
+
+queue "RocketMQ\nORDER_CREATE" as MQ
+box "consumer 实例" #E8F5E9
+  participant "OrderCreateListener" as L
+  participant "OrderCreateService" as Svc
+  participant "SeckillCompensate\nService" as Comp
+  participant "SeckillExecutor" as Exec
+end box
+database "MySQL" as DB
+database "Redis" as R
+queue "ORDER_CLOSE\n（任意时刻定时）" as MQC
+
+MQ -> L : onMessage(MessageExt)
+activate L
+L -> L : JSON 解析
+alt 解析失败
+  L -> L : 记 error 并 **直接 ACK**
+  note right of L
+    解析不了的消息重试一万次也解析不了。
+    抛出去只会在队列里转 5 圈再进死信，
+    中间刷 5 遍同样的错误日志
+  end note
+  L --> MQ : ACK
+end
+
+L -> L : MDC.put(traceId)
+note right of L
+  traceId 跨 MQ 传递。不 put 的话消费端日志
+  全无 traceId，而「有资格但没订单」的排查
+  恰好要从秒杀提交一路追到这里
+end note
+
+L -> L : 版本校验 version ≤ CURRENT
+alt 未知版本
+  L -> MQ : 抛异常 → 重试耗尽 → **进死信**
+  note right of L
+    新版本字段含义可能变了，
+    用旧代码解析出来可能是一张金额 0 的订单 ——
+    那比不处理危险得多
+  end note
+end
+
+L -> Svc : handle(msg)
+activate Svc
+
+group **幂等 L1**：查一次就够挡住 99% 的重复
+  Svc -> DB : selectByRequestNo(requestNo)
+  alt 已存在
+    DB --> Svc : Order
+    Svc --> L : Created(order, duplicate=true)
+    L --> MQ : **ACK**（不重复埋点）
+  end
+end
+
+group 落库事务（4 张表，**一个事务**）
+  Svc -> DB : BEGIN
+  Svc -> DB : UPDATE t_seckill_goods\nSET available-1, locked+1\n**WHERE available_stock >= 1**
+  note right of Svc
+    条件更新 —— 阶段二后退化为兜底，
+    但**不能删**：Redis 数据丢失后重抢时它是最后一道防线。
+    库存三分口径 total = available + locked + sold 恒成立
+  end note
+  alt 影响行数 = 0（DB 库存真不足）
+    DB --> Svc : 0 rows
+    Svc -> DB : ROLLBACK
+    Svc --> L : BizException(STOCK_NOT_ENOUGH, **确定性**)
+  end
+
+  Svc -> DB : INSERT t_order\n（uk_request_no / uk_activity_sku_user / uk_order_no）
+  note right of Svc
+    **幂等 L2**：三个唯一键各拦一类异常
+    · uk_request_no —— MQ 重复投递、消费端重试
+    · uk_activity_sku_user —— Redis 数据丢失后重抢
+    · uk_order_no —— 订单号碰撞兜底
+  end note
+  alt 唯一键冲突
+    DB --> Svc : DuplicateKeyException
+    Svc -> DB : ROLLBACK
+    Svc --> L : BizException(ALREADY_BOUGHT, **确定性**)
+  end
+
+  Svc -> DB : INSERT t_order_item（全字段快照）
+  Svc -> DB : INSERT t_stock_log\n（uk_biz_type 幂等）
+  Svc -> DB : UPSERT t_seckill_request status=1
+
+  Svc -> MQC : **registerAfterCommit**(ORDER_CLOSE,\ndeliverTime = **expire_time**)
+  note right of Svc
+    消息行写在**同一事务**里、send 放在提交后 ——
+    这让「订单已创建」与「关单消息已登记」成为原子的。
+    投递时刻取 expire_time 而不是「现在+15分钟」：
+    重试导致的延迟不会顺延关单时刻
+  end note
+
+  Svc -> DB : COMMIT
+end
+Svc --> L : Created(order, duplicate=false)
+deactivate Svc
+
+L -> L : metrics.orderCreated()
+note right of L
+  埋点在**回写结论之前**。回写是「让外部看到成功」的那一刻，
+  顺序反了的话观察者有个窗口能看到
+  「订单已成功」而计数器还没动
+end note
+
+L -> Exec : afterCommit → writeResult(SUCCESS, orderNo)
+Exec -> R : EVALSHA **write_result.lua**
+note right of Exec
+  必须在**提交之后**。提交前写的话，客户端可能查到
+  「秒杀成功 + 订单号」而那个事务随后回滚了 ——
+  它拿着一个不存在的订单号
+end note
+
+L -> DB : markConsumedByBizKey(**bizKey, topic**)
+note right of L
+  按 (biz_key, topic) 且**只从「已发送」推进**：
+  同一 requestNo 在多个 Topic 下各有一条消息，只按 bizKey 会误更新另一条；
+  允许从「待发送」推进则会让一条尚未发出的消息被标成已消费，
+  重发任务再也不碰它 —— 投递意图就这么丢了。
+
+  这一步**不影响正确性**（只是让消息表能安全归档），所以失败只记 debug
+end note
+L --> MQ : ACK
+deactivate L
+
+== 失败分支：消费端唯一的判断 ==
+
+note over L, R
+  |= 失败类型 |= 例子 |= 动作 |= 为什么 |
+  | **确定性** | DB 库存真不足、唯一键冲突 | 回补 + ACK | 重试 5 次也不会成功，白占 5 分钟库存 |
+  | **可恢复** | DB 连不上、超时、死锁 | 抛出 → 重试 | 下一次可能就成了，回补反而让用户白丢资格 |
+  | **重复投递** | ACK 丢了、手动重投 | ACK | L1 幂等命中，订单已经在了 |
+  | 并发同 requestNo | 另一方已建单 | ACK | REPEATABLE READ 下查不到对方的提交，但它确实存在 |
+end note
+
+group 确定性失败 → 立即回补
+  L -> Comp : rollback(msg, errorCode)
+  Comp -> Exec : rollback(..., **keepBought**, **failStatus**)
+  Exec -> R : EVALSHA **rollback.lua**
+  note right of R
+    两个参数都是必需的：
+    · keepBought=false 才还资格。撞 uk_activity_sku_user 时若连资格一起还，
+      就是「重抢 → Redis 放行 → DB 又冲突 → 又回补」的死循环
+    · failStatus 让 Redis 与 DB 的结论一致。固定写 5（系统繁忙）而 DB 写 3（已参与过）时，
+      返回哪个取决于 TTL 到没到，且偏向更坏的一边 —— 用户看到「系统繁忙」会不停重试
+  end note
+  Comp -> DB : t_seckill_request status = 2/3/5
+  L --> MQ : **ACK**（不再重试）
+end
+
+group 可恢复失败 → 重试 5 次 → 死信
+  L -> MQ : 抛 IllegalStateException
+  MQ -> MQ : 退避重试 ×5
+  MQ -> "OrderCreateDlqListener" as DLQ : %DLQ%GID_FSS_ORDER_CREATE
+  DLQ -> R : 兜底回补
+  note right of DLQ
+    与 onSendGiveUp 是**两条不同的路径**：
+    重试耗尽 = 消息没发出去；进死信 = 发出去了但处理不了。
+    兜底动作相同，触发条件完全不同
+  end note
+end
+
+@enduml

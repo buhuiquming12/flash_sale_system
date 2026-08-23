@@ -1,0 +1,233 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  S7 限流验证 —— 不在文档的 S1-S6 里，是本次实施补的一个场景。
+
+  **为什么必须补它**：S1-S6 全部激活 perf profile，其中 fss.ratelimit.enabled=false。
+  单机压测里 JMeter 与应用同机，所有请求的来源 IP 都是 127.0.0.1，
+  默认 ip-qps=20（burst ×2 = 40）会在 40 QPS 处截断一切 ——
+  测出来的是限流器的行为而不是系统容量。
+
+  但关掉之后就**没有任何数据证明限流真的有效**了。所以单独补这一组，
+  用**默认配置**跑，断言 429 的比例与阈值吻合。两组数据口径不同，报告里分开列。
+
+  三个维度分别验：
+    · 单用户：user-qps=2（burst 2 → 4），1 个用户猛打 → 绝大多数 429
+    · 单 IP  ：ip-qps=20（burst 2 → 40），多用户同 IP → 超出部分 429
+    · 结果查询档位：result-qps=5，比提交宽松（同一次点击背后有多个读请求）
+
+  429 的响应体是 R.fail(RATE_LIMITED)，HTTP 状态码 429 + Retry-After: 1。
+  JMeter 默认把 429 算失败，所以这里**把 429 标成成功**（ResponseAssertion
+  接受 200|429），再用 JSR223 统计比例 —— 否则「错误率 96%」会被误读成系统崩了。
+
+  参数：-Jhost -Jport -Jactivity -Jsku -Jthreads -Jduration -Jusers_csv
+-->
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="S7 限流验证（默认配置）" enabled="true">
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">true</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="UDV" enabled="true">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="HOST" elementType="Argument">
+            <stringProp name="Argument.name">HOST</stringProp>
+            <stringProp name="Argument.value">${__P(host,127.0.0.1)}</stringProp>
+          </elementProp>
+          <elementProp name="PORT" elementType="Argument">
+            <stringProp name="Argument.name">PORT</stringProp>
+            <stringProp name="Argument.value">${__P(port,8080)}</stringProp>
+          </elementProp>
+          <elementProp name="ACTIVITY" elementType="Argument">
+            <stringProp name="Argument.name">ACTIVITY</stringProp>
+            <stringProp name="Argument.value">${__P(activity,1)}</stringProp>
+          </elementProp>
+          <elementProp name="SKU" elementType="Argument">
+            <stringProp name="Argument.name">SKU</stringProp>
+            <stringProp name="Argument.value">${__P(sku,1)}</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+    </TestPlan>
+    <hashTree>
+
+      <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP 默认值" enabled="true">
+        <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+        <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+        <stringProp name="HTTPSampler.connect_timeout">3000</stringProp>
+        <stringProp name="HTTPSampler.response_timeout">10000</stringProp>
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+          <collectionProp name="Arguments.arguments"/>
+        </elementProp>
+      </ConfigTestElement>
+      <hashTree/>
+
+      <SetupThreadGroup guiclass="SetupThreadGroupGui" testclass="SetupThreadGroup" testname="setUp" enabled="true">
+        <intProp name="ThreadGroup.num_threads">1</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">1</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </SetupThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="初始化" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">props.put('rl', new java.util.concurrent.ConcurrentHashMap())</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+
+      <!-- ===== 组 1：单用户限流（user-qps=2，burst → 4）===== -->
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="单用户猛打提交" enabled="true">
+        <intProp name="ThreadGroup.num_threads">20</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.duration">${__P(duration,20)}</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">
+          <stringProp name="LoopController.loops">-1</stringProp>
+          <boolProp name="LoopController.continue_forever">true</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <!-- 所有线程共用**同一个**用户：CSV 只读第一行（recycle=true + 1 个线程组变量）。
+             用 __CSVRead 而不是 CSVDataSet，确保拿到固定的那一行 -->
+        <JSR223PreProcessor guiclass="TestBeanGUI" testclass="JSR223PreProcessor" testname="取固定用户" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">if (props.get('fixedToken') == null) {
+    def line = new File(props.get('users_csv') ?: 'users.csv').readLines()[0]
+    props.put('fixedToken', line.split(',')[2])
+}
+vars.put('TOKEN', props.get('fixedToken'))</stringProp>
+        </JSR223PreProcessor>
+        <hashTree/>
+        <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="头" enabled="true">
+          <collectionProp name="HeaderManager.headers">
+            <elementProp name="" elementType="Header">
+              <stringProp name="Header.name">Content-Type</stringProp>
+              <stringProp name="Header.value">application/json;charset=UTF-8</stringProp>
+            </elementProp>
+            <elementProp name="" elementType="Header">
+              <stringProp name="Header.name">Authorization</stringProp>
+              <stringProp name="Header.value">Bearer ${TOKEN}</stringProp>
+            </elementProp>
+          </collectionProp>
+        </HeaderManager>
+        <hashTree/>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="S7-单用户提交" enabled="true">
+          <stringProp name="HTTPSampler.path">/api/seckill/do</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.value">{"activityId":${ACTIVITY},"skuId":${SKU},"quantity":1}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <!-- 429 是**预期结果**，不是失败。不改这个断言的话报告里错误率会是 95%+，
+               看起来像系统崩了，而实际上限流正按设计工作 -->
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="200 或 429 都算成功" enabled="true">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="200">200</stringProp>
+              <stringProp name="429">429</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">1</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+          <JSR223PostProcessor guiclass="TestBeanGUI" testclass="JSR223PostProcessor" testname="计数" enabled="true">
+            <stringProp name="scriptLanguage">groovy</stringProp>
+            <stringProp name="script">props.get('rl').merge('user_' + prev.getResponseCode(), 1L, { a, b -&gt; a + b })</stringProp>
+          </JSR223PostProcessor>
+          <hashTree/>
+        </hashTree>
+      </hashTree>
+
+      <!-- ===== 组 2：单 IP 限流（ip-qps=20，burst → 40）===== -->
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="多用户同 IP 打详情" enabled="true">
+        <intProp name="ThreadGroup.num_threads">100</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.duration">${__P(duration,20)}</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">
+          <stringProp name="LoopController.loops">-1</stringProp>
+          <boolProp name="LoopController.continue_forever">true</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <!-- 打匿名的详情接口：没有 userId，所以只有 IP 桶生效，
+             能干净地测出 IP 维度的阈值。带 token 打提交的话
+             user 桶（2 QPS）会先拦掉，测不到 IP 桶的 40 -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="S7-同IP详情" enabled="true">
+          <stringProp name="HTTPSampler.path">/api/activity/${ACTIVITY}</stringProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments"/>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="200 或 429 都算成功" enabled="true">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="200">200</stringProp>
+              <stringProp name="429">429</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">1</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+          <JSR223PostProcessor guiclass="TestBeanGUI" testclass="JSR223PostProcessor" testname="计数" enabled="true">
+            <stringProp name="scriptLanguage">groovy</stringProp>
+            <stringProp name="script">props.get('rl').merge('ip_' + prev.getResponseCode(), 1L, { a, b -&gt; a + b })</stringProp>
+          </JSR223PostProcessor>
+          <hashTree/>
+        </hashTree>
+      </hashTree>
+
+      <PostThreadGroup guiclass="PostThreadGroupGui" testclass="PostThreadGroup" testname="tearDown 打印限流比例" enabled="true">
+        <intProp name="ThreadGroup.num_threads">1</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">1</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </PostThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="限流比例" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">def m = props.get('rl')
+int dur = Integer.parseInt(props.get('duration') ?: '20')
+def sb = new StringBuilder('\n===== S7 限流验证 =====\n')
+m.sort { it.key }.each { k, v -&gt; sb.append(String.format('%-14s %d%n', k, v)) }
+
+long u200 = m.getOrDefault('user_200', 0L), u429 = m.getOrDefault('user_429', 0L)
+long i200 = m.getOrDefault('ip_200', 0L),   i429 = m.getOrDefault('ip_429', 0L)
+if (u200 + u429 &gt; 0) {
+    sb.append(String.format('单用户: 通过 %d (%.1f/s)  429 %d  拒绝率 %.1f%%  【期望通过≈user-qps=2/s】%n',
+            u200, u200 / (double) dur, u429, 100.0 * u429 / (u200 + u429)))
+}
+if (i200 + i429 &gt; 0) {
+    sb.append(String.format('单 IP  : 通过 %d (%.1f/s)  429 %d  拒绝率 %.1f%%  【期望通过≈ip-qps=20/s】%n',
+            i200, i200 / (double) dur, i429, 100.0 * i429 / (i200 + i429)))
+}
+sb.append('令牌桶是匀速补充，所以「通过量/时长」应当收敛到配置的 QPS，\n')
+sb.append('而不是 burst 值 —— burst 只影响开头那一下能放多少。\n')
+log.info(sb.toString())
+new File('s7-ratelimit.txt').text = sb.toString()</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>

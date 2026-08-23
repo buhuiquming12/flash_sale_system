@@ -72,6 +72,19 @@ ehthumbs.db
 Desktop.ini
 .DS_Store
 
+# 阶段五工具链（PlantUML jar 约 29MB、JMeter 解压后约 200MB，不进仓库）
+# 出图与压测的产物是提交的，工具本身按 README「阶段五工具链」一节自行下载
+.tools/
+
+# 压测产物：只保留 _evidence/（关键证据）与 summary.csv（报告用的汇总），
+# 其余全部忽略 ——
+#   · raw.jtl 单场景可达数百 MB
+#   · users.csv 里是 12000 个真实 JWT，不该进仓库
+#   · 各场景目录里的 jmeter.log / metrics-*.txt 是排查用的中间产物
+perf/results/*
+!perf/results/_evidence/
+!perf/results/summary.csv
+
 # Misc
 .idea_modules/
 *.hprof

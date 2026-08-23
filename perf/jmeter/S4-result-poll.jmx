@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  S4 结果轮询 —— 文档目标：8000 并发 / 2 min / P99 < 50ms
+
+  这是**真实流量最大的接口**：异步化之后每个用户提交一次就要轮询若干次
+  （pollAfterMs 默认 300ms，一次秒杀轮询 3-10 次很正常）。
+  所以它的 QPS 是提交接口的数倍，单独测有必要。
+
+  两个易错点：
+
+  ① **requestNo 必须配它自己的 token。** queryResult 里有归属校验
+     （assertOwner），用别人的 token 查会返回 REQUEST_NOT_FOUND ——
+     而且它与「请求不存在」故意返回同一个码（不泄漏请求号的有效性）。
+     所以 S2 写 requests.csv 时把 requestNo 和 token 成对写下来，这里成对读。
+     两者错配的话整个 S4 全是 4004，而看起来像「系统查不到数据」。
+
+  ② **带上 activityId 与 skuId**。带了才能命中 Redis（req key 含
+     {activityId:skuId} hash tag），不带就退化成回查 MySQL ——
+     那测的是另一条路径，P99 会高一个量级。客户端刚提交过秒杀，这两个值它一定有。
+
+  前置条件：requests.csv 由 S2 产出。
+
+  参数：-Jhost -Jport -Jactivity -Jsku -Jthreads -Jduration -Jrampup -Jreq_csv
+-->
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="S4 结果轮询" enabled="true">
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="UDV" enabled="true">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="HOST" elementType="Argument">
+            <stringProp name="Argument.name">HOST</stringProp>
+            <stringProp name="Argument.value">${__P(host,127.0.0.1)}</stringProp>
+          </elementProp>
+          <elementProp name="PORT" elementType="Argument">
+            <stringProp name="Argument.name">PORT</stringProp>
+            <stringProp name="Argument.value">${__P(port,8080)}</stringProp>
+          </elementProp>
+          <elementProp name="ACTIVITY" elementType="Argument">
+            <stringProp name="Argument.name">ACTIVITY</stringProp>
+            <stringProp name="Argument.value">${__P(activity,1)}</stringProp>
+          </elementProp>
+          <elementProp name="SKU" elementType="Argument">
+            <stringProp name="Argument.name">SKU</stringProp>
+            <stringProp name="Argument.value">${__P(sku,1)}</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+    </TestPlan>
+    <hashTree>
+
+      <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP 默认值" enabled="true">
+        <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+        <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+        <stringProp name="HTTPSampler.connect_timeout">3000</stringProp>
+        <stringProp name="HTTPSampler.response_timeout">10000</stringProp>
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+          <collectionProp name="Arguments.arguments"/>
+        </elementProp>
+      </ConfigTestElement>
+      <hashTree/>
+
+      <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="通用头" enabled="true">
+        <collectionProp name="HeaderManager.headers">
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">Authorization</stringProp>
+            <stringProp name="Header.value">Bearer ${TOKEN}</stringProp>
+          </elementProp>
+        </collectionProp>
+      </HeaderManager>
+      <hashTree/>
+
+      <SetupThreadGroup guiclass="SetupThreadGroupGui" testclass="SetupThreadGroup" testname="setUp" enabled="true">
+        <intProp name="ThreadGroup.num_threads">1</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">1</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </SetupThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="检查 requests.csv 非空" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">props.put('bizCodes4', new java.util.concurrent.ConcurrentHashMap())
+def f = new File(props.get('req_csv') ?: 'requests.csv')
+if (!f.exists() || f.length() == 0) {
+    // 空文件会让 CSVDataSet 把 TOKEN 读成空串 → 全部 401，
+    // 而那看起来像「认证坏了」。这里直接把失败原因说清楚
+    log.error('requests.csv 为空 —— S4 必须在 S2 之后跑，它消费 S2 产出的 requestNo')
+    throw new IllegalStateException('requests.csv 为空，先跑 S2')
+}
+log.info('requests.csv 行数约 ' + f.readLines().size())</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="结果轮询" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">${__P(threads,400)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${__P(rampup,10)}</stringProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.duration">${__P(duration,60)}</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">
+          <stringProp name="LoopController.loops">-1</stringProp>
+          <boolProp name="LoopController.continue_forever">true</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+
+        <!-- requestNo 与 token 成对读，顺序不能错（见文件头注释 ①） -->
+        <CSVDataSet guiclass="TestBeanGUI" testclass="CSVDataSet" testname="requests.csv" enabled="true">
+          <stringProp name="filename">${__P(req_csv,requests.csv)}</stringProp>
+          <stringProp name="fileEncoding">UTF-8</stringProp>
+          <stringProp name="variableNames">REQNO,TOKEN</stringProp>
+          <boolProp name="ignoreFirstLine">false</boolProp>
+          <stringProp name="delimiter">,</stringProp>
+          <boolProp name="quotedData">false</boolProp>
+          <boolProp name="recycle">true</boolProp>
+          <boolProp name="stopThread">false</boolProp>
+          <stringProp name="shareMode">shareMode.all</stringProp>
+        </CSVDataSet>
+        <hashTree/>
+
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="GET /api/seckill/result" enabled="true">
+          <stringProp name="HTTPSampler.path">/api/seckill/result</stringProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="requestNo" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">true</boolProp>
+                <stringProp name="Argument.name">requestNo</stringProp>
+                <stringProp name="Argument.value">${REQNO}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+                <boolProp name="HTTPArgument.use_equals">true</boolProp>
+              </elementProp>
+              <!-- 带上这两个才命中 Redis，不带就回查 MySQL（见文件头注释 ②） -->
+              <elementProp name="activityId" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">true</boolProp>
+                <stringProp name="Argument.name">activityId</stringProp>
+                <stringProp name="Argument.value">${ACTIVITY}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+                <boolProp name="HTTPArgument.use_equals">true</boolProp>
+              </elementProp>
+              <elementProp name="skuId" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">true</boolProp>
+                <stringProp name="Argument.name">skuId</stringProp>
+                <stringProp name="Argument.value">${SKU}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+                <boolProp name="HTTPArgument.use_equals">true</boolProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <JSONPathAssertion guiclass="JSONPathAssertionGui" testclass="JSONPathAssertion" testname="断言 code=0" enabled="true">
+            <stringProp name="JSON_PATH">$.code</stringProp>
+            <stringProp name="EXPECTED_VALUE">0</stringProp>
+            <boolProp name="JSONVALIDATION">true</boolProp>
+            <boolProp name="EXPECT_NULL">false</boolProp>
+            <boolProp name="INVERT">false</boolProp>
+            <boolProp name="ISREGEX">false</boolProp>
+          </JSONPathAssertion>
+          <hashTree/>
+          <JSR223PostProcessor guiclass="TestBeanGUI" testclass="JSR223PostProcessor" testname="统计结论分布" enabled="true">
+            <stringProp name="scriptLanguage">groovy</stringProp>
+            <stringProp name="script">import groovy.json.JsonSlurper
+def counts = props.get('bizCodes4')
+try {
+    def r = new JsonSlurper().parseText(prev.getResponseDataAsString())
+    // status: 0 排队中 1 成功 2 库存不足 3 重复购买 4 创建失败 5 已补偿
+    counts.merge('code_' + r.code + '_status_' + (r.data?.status ?: 'na'), 1L, { a, b -&gt; a + b })
+} catch (e) {
+    counts.merge('unparseable', 1L, { a, b -&gt; a + b })
+}</stringProp>
+          </JSR223PostProcessor>
+          <hashTree/>
+        </hashTree>
+
+      </hashTree>
+
+      <PostThreadGroup guiclass="PostThreadGroupGui" testclass="PostThreadGroup" testname="tearDown" enabled="true">
+        <intProp name="ThreadGroup.num_threads">1</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">1</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </PostThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="结论分布" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="script">def sb = new StringBuilder('\n===== S4 结论分布 =====\n')
+props.get('bizCodes4').sort { it.key }.each { k, v -&gt; sb.append(String.format('%-32s %d%n', k, v)) }
+log.info(sb.toString())</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>

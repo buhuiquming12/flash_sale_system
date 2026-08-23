@@ -1,0 +1,166 @@
+@startuml 04-时序-超时关单
+' ============================================================================
+' 超时关单时序 —— OrderCloseListener + OrderService#closeOrder + StockReleaseService
+'
+' 重点：定时消息是主路径、定时扫描是兜底；DB 回补必须与关单同事务、
+' Redis 回补必须可重试；三层幂等各自防的是不同的失效场景。
+' ============================================================================
+!pragma layout smetana
+
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontSize 12
+skinparam shadowing false
+
+title 超时关单与库存回补（RELEASE 语义：还库存，**保留**用户资格）
+
+queue "ORDER_CLOSE\n任意时刻定时消息" as MQC
+box "consumer 实例" #E8F5E9
+  participant "OrderCloseListener" as L
+  participant "OrderServiceImpl" as OS
+  participant "StockReleaseService" as SR
+  participant "StockReleaseListener" as SRL
+  participant "SeckillExecutor" as Exec
+end box
+box "job 实例" #FFF3E0
+  participant "OrderCloseJob\n（兜底扫描）" as Job
+end box
+database "MySQL" as DB
+queue "STOCK_RELEASE" as MQR
+database "Redis" as R
+
+== 主路径：定时消息 ==
+
+note over MQC
+  投递时刻 = 订单的 **expire_time**，
+  不是「现在 + 15 分钟」。
+  消息在创建订单的同一事务里登记（见 03 图），
+  所以「订单存在」⟹「关单消息已登记」
+end note
+
+MQC -> L : 到点投递
+activate L
+L -> L : MDC.put(traceId)
+
+L -> DB : selectByOrderNo
+alt 订单不存在
+  L --> MQC : ACK（记 warn）
+else 状态已是终态（已支付/已取消）
+  L --> MQC : **ACK**
+  note right of L
+    支付赢了竞态。这不是错误，
+    是 C10/F9 每轮都会出现的正常分支
+  end note
+else 还没到期
+  L --> MQC : ACK
+  note right of L
+    时钟漂移或消息早到。
+    宁可放过一轮让扫描兜底，
+    也不能提前关掉一张还能支付的单
+  end note
+end
+
+L -> OS : closeOrder(orderNo, "超时未支付(定时消息)")
+activate OS
+
+group 关单事务（**DB 回补在同一事务内**）
+  OS -> DB : BEGIN
+  OS -> DB : UPDATE t_order SET status=2\n**WHERE status=0**
+  note right of OS
+    幂等 L3：状态条件更新。
+    影响 0 行 = 别人已经处理过（或支付赢了），直接返回
+  end note
+
+  OS -> SR : release(orderNo, reason)
+  activate SR
+  SR -> DB : UPDATE t_order SET stock_released=1\n**WHERE stock_released=0**
+  note right of SR
+    **幂等 1**：条件更新把自己变成唯一执行者
+  end note
+  alt 影响 0 行
+    SR --> OS : false（已释放过）
+  end
+
+  SR -> DB : INSERT t_stock_log\n(**uk_biz_type** = biz_no + change_type)
+  note right of SR
+    **幂等 2**：读改写有并发窗口，
+    唯一键插入是数据库层的串行化
+  end note
+  alt DuplicateKeyException
+    SR --> OS : false
+  end
+
+  SR -> DB : UPDATE t_seckill_goods\nSET available+qty, locked-qty\n**WHERE locked_stock >= qty**
+  alt 影响 0 行
+    SR -> DB : **抛异常 → 整个事务回滚**
+    note right of SR
+      locked_stock 不足说明账目已经错乱。
+      若改成「回补失败但订单已标记 released」，
+      就永久少一份库存
+    end note
+  end
+
+  SR -> MQR : **registerAfterCommit**(STOCK_RELEASE)
+  SR -> DB : COMMIT
+  deactivate SR
+end
+
+note over OS, SR
+  **为什么 DB 回补必须同事务，而不是 REQUIRES_NEW**
+  曾考虑「回补失败不该把已关的订单回滚」，但那是错的：
+  回补先独立提交、外层关单随后回滚 → stock_released=1 且库存已还，
+  而订单还是待支付 —— 用户仍能支付这张单，**等于超卖**。
+  同事务下回补失败则一起回滚，订单留在待支付，由扫描重试，没有泄漏。
+end note
+
+OS --> L : closed = true
+deactivate OS
+L -> DB : markConsumed
+L --> MQC : ACK
+deactivate L
+
+== Redis 回补：必须可重试，所以走消息 ==
+
+MQR -> SRL : STOCK_RELEASE
+activate SRL
+SRL -> Exec : release(activityId, skuId, orderNo, qty)
+Exec -> R : EVALSHA **release.lua**\nINCRBY stock + SADD released
+note right of R
+  脚本内先判 **SISMEMBER released**：
+  「回补失败」与「早就回补过了」都返回非 0，
+  分不开的话重复投递会被当成失败无限重试、最后整批进死信 ——
+  一个纯粹由「把幂等命中误判成失败」造出来的故障。
+
+  **幂等 3**（Redis Set）：前两层都在 DB 里，
+  管不住 Redis 侧的重复 INCRBY
+end note
+alt 回补成功或幂等命中
+  SRL --> MQR : ACK
+else Redis 不可用
+  SRL -> MQR : 抛异常 → 退避重试 ×5 → 死信
+end
+deactivate SRL
+
+note over SRL, R
+  **为什么 Redis 这半非得走消息**（与 docs/05 的一处刻意偏差）
+  DB 回补**能**同事务，所以必须同事务；
+  Redis 回补**没法**加入 DB 事务，所以必须可重试。
+  阶段二是提交后直接 INCRBY、失败只打日志等对账 ——
+  那期间 Redis 少一份库存，是实打实的少卖。
+
+  顺序仍是「提交之后才投递」：反了的话 Redis 已加回、别人已能抢到，
+  而 DB 事务可能回滚 → 订单还是待支付、DB 库存没还，Redis 却多放一个资格 = 超卖
+end note
+
+== 兜底：定时扫描 ==
+
+Job -> Job : @Scheduled + **@DistributedLock**
+Job -> DB : 捞 status=0 AND expire_time < now\n（idx_status_expire）
+Job -> OS : closeOrder(...)（同一个方法）
+note right of Job
+  异步化之后扫描**退化为兜底**，但不能删：
+  定时消息可能丢（F10），而「订单永久待支付」
+  不会自己暴露 —— 用户不会来投诉一张
+  他早就放弃的订单，库存却一直被占着
+end note
+
+@enduml

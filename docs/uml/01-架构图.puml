@@ -1,0 +1,104 @@
+@startuml 01-架构图
+' ============================================================================
+' 总体架构图 —— 对应 docs/00-设计总览.md §3
+'
+' 用 Smetana 布局（PlantUML 内置的 graphviz Java 移植），出图不需要本机装 graphviz。
+'
+' 排版上有一条硬经验：**细节写进节点，不要写进边标签**。
+' 第一版把「回写结论(脚本 D)」「补偿回补(脚本 B)」这类说明挂在 30 条边上，
+' 每条带文字的边都迫使 graphviz 留出横向空间，结果 Redis 和 web 被拉到画布两端、
+' 连线横穿全图，右侧的可观测框还被挤出边界。现在只留 13 条层间边。
+' ============================================================================
+!pragma layout smetana
+
+skinparam backgroundColor #FEFEFE
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontSize 12
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam nodesep 25
+skinparam ranksep 40
+skinparam ArrowColor #37474F
+skinparam ArrowFontSize 11
+skinparam rectangle {
+  BorderColor #90A4AE
+  BackgroundColor #FFFFFF
+}
+skinparam database {
+  BorderColor #5C6BC0
+  BackgroundColor #E8EAF6
+}
+skinparam queue {
+  BorderColor #EF6C00
+  BackgroundColor #FFF3E0
+}
+
+title 秒杀系统总体架构（阶段一~四实现范围）
+
+rectangle "**客户端**\n演示页 / JMeter" as client #F5F5F5
+
+rectangle "**Nginx**\nlimit_req 单 IP 限流 · 负载均衡到 2 个 web 实例" as nginx #ECEFF1
+
+rectangle "**web 实例 ×2**（无状态，可横向扩）" as web #E3F2FD {
+  rectangle "Sentinel 接口级 QPS + 熔断\n（exceptionsToIgnore=BizException：\n业务失败不进故障统计）" as sentinel
+  rectangle "秒杀提交 / 结果查询\n活动详情（逻辑过期+单飞）/ 订单 / 支付" as ctrl
+  rectangle "**DegradeSwitch**\n本地 volatile 等级，每秒刷一次\n生效等级 = max(人工, 自动)" as degrade #FFF9C4
+}
+
+together {
+  database "**Redis 7.2**\n——\nstock · bought · req（带 hash tag）\n活动元数据 · 详情缓存\n令牌桶 · Redisson 锁\nuncertain 待确认 ZSet\n——\n**五段 Lua**：判扣 / 补偿回补 /\n取消回补 / 写结论 / 令牌桶" as redis
+
+  queue "**RocketMQ 5.3**\n——\nORDER_CREATE ×16 队列\nORDER_CLOSE（任意时刻定时）\nSTOCK_RELEASE ×4\nSTOCK_ROLLBACK ×4\n%DLQ%GID_FSS_ORDER_CREATE\n——\nautoCreateTopicEnable=false" as mq
+
+  database "**MySQL 8.0**\n——\n12 张表 · 无物理外键\n唯一键兜底 + CHECK 约束\n本地消息表 / 库存流水 / 对账任务\n——\ntotal = available + locked + sold" as mysql
+}
+
+rectangle "**consumer 实例 ×2**（订单在这里诞生）" as consumer #E8F5E9 {
+  rectangle "OrderCreateListener\n异步落库 · 12 线程 · CONCURRENTLY\n确定性失败就地回补并 ACK" as lsnCreate
+  rectangle "OrderCloseListener\n定时消息关单\n（DB 回补**同事务**）" as lsnClose
+  rectangle "StockReleaseListener\nRedis 回补（脚本 C）" as lsnRelease
+  rectangle "StockRollbackListener\n补偿回补（脚本 B）" as lsnRollback
+  rectangle "OrderCreateDlqListener\n死信兜底回补" as lsnDlq
+}
+
+rectangle "**job 实例 ×1**（全部 @Scheduled + @DistributedLock）" as job #FFF3E0 {
+  rectangle "预热（setIfAbsent 幂等）\n活动状态推进" as jobWarm
+  rectangle "关单扫描（兜底）\n消息重发（send_count<max）" as jobClose
+  rectangle "三类对账：资格 1min\n库存 5min · 支付 10min\n待确认判定 10s" as jobRec
+  rectangle "降级监控 15s\n积压 / 连接池 → 取最大值" as jobDeg
+}
+
+rectangle "**Prometheus** 2.54\n16 条告警规则（6 critical + 10 warning）" as prom #FFEBEE
+rectangle "**Grafana** 11.2\n20 面板总览看板" as grafana #FFEBEE
+
+' ---------------- 只保留层间边，且尽量不加标签 ----------------
+client  --> nginx
+nginx   --> web
+
+web     --> redis  : ① Lua 判扣
+web     --> mysql  : ② 消息表
+web     --> mq     : ③ 投递后\n立即返回「排队中」
+
+mq      --> consumer
+consumer --> mysql
+consumer --> redis
+
+job     --> redis
+job     --> mysql
+job     --> mq
+
+web      ..> prom
+consumer ..> prom
+job      ..> prom
+prom    --> grafana
+
+legend bottom
+  |= 颜色 |= 角色 |= 关键约束 |
+  | <#E3F2FD> | web | 只做 Lua + 投消息，**不碰 MySQL 主链路** |
+  | <#E8F5E9> | consumer | 落库逻辑与阶段一是同一个方法 |
+  | <#FFF3E0> | job | 不激活时主链路仍完整，但兜底机制全不在 |
+  | <#FFEBEE> | 可观测 | 指标名不能带 Prometheus 保留后缀 |
+  ①②③ 是秒杀提交路径上的顺序，逐步细节见 02-时序-秒杀提交
+endlegend
+
+@enduml

@@ -54,7 +54,9 @@ class SeckillLuaTest extends IntegrationTestBase {
         assertThat(r.unexpected).as("不允许出现非业务异常").isEmpty();
         assertThat(r.success.get()).as("成功数必须恰好等于库存: %s", r).isEqualTo(stock);
         assertThat(r.count(ErrorCode.STOCK_NOT_ENOUGH))
-                .as("其余请求全部应是库存不足（Lua 判掉，根本没走到 MySQL）")
+                .as("其余请求全部应是库存不足（Lua 判掉，根本没走到 MySQL）。"
+                        + "少几个通常意味着有请求走了别的拒绝分支 —— "
+                        + "把整个分布打出来才能看出是哪一条: %s", r)
                 .isEqualTo(concurrency - stock);
 
         assertThat(fixture.redisStock(act.activityId(), act.skuId()))

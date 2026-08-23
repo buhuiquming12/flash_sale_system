@@ -1,0 +1,265 @@
+@startuml 07-ER图
+' ============================================================================
+' 数据模型 ER 图 —— 严格对应 sql/V1__init.sql 的 12 张表
+'
+' 关系用「逻辑外键」表示：**库里没有真实 FOREIGN KEY**。
+' 秒杀写入是热点路径，外键检查要额外锁父表行，
+' 而这些约束靠应用层 + 唯一键已经够了。
+'
+' 图上刻意标出每个 UK —— 幂等不是"写在代码里的逻辑"，
+' 它的物理载体就是这些唯一键。
+' ============================================================================
+!pragma layout smetana
+
+skinparam defaultFontName Microsoft YaHei
+skinparam defaultFontSize 11
+skinparam shadowing false
+skinparam entity {
+  BorderColor #5C6BC0
+  BackgroundColor #FFFFFF
+}
+
+title 数据模型（12 张表 / 无物理外键 / 时间列统一 DATETIME(3)、金额 DECIMAL(12,2)）
+
+' ------------------------------------------------ 用户与商品
+entity "**t_user**\n用户" as user #E8EAF6 {
+  * id : bigint <<PK>>
+  --
+  **UK** username
+  **UK** phone
+  password : varchar(100) BCrypt
+  role : tinyint  0=用户 1=管理员
+  status : tinyint  0=禁用 1=正常 2=风控冻结
+}
+
+entity "**t_product**\n商品" as product #E8EAF6 {
+  * id : bigint <<PK>>
+  --
+  title, sub_title, detail, main_image
+  status : tinyint  0=下架 1=上架
+}
+
+entity "**t_sku**\nSKU" as sku #E8EAF6 {
+  * id : bigint <<PK>>
+  --
+  # product_id : bigint
+  spec, spec_json
+  price : decimal(12,2)  日常售价
+  stock : int  日常库存
+  CHECK stock >= 0
+}
+
+' ------------------------------------------------ 活动（核心）
+entity "**t_seckill_activity**\n秒杀活动" as act #C5CAE9 {
+  * id : bigint <<PK>>
+  --
+  start_time, end_time : datetime(3)
+  status : tinyint\n  0=待发布 1=待开始 2=进行中\n  3=已结束 4=已关闭
+  **warmup_state** : tinyint\n  0=未预热 1=预热中\n  2=完成 3=失败
+  warmup_version : int
+  # creator_id : bigint
+  CHECK end_time > start_time
+}
+
+entity "**t_seckill_goods**\n秒杀商品（热点表）" as goods #C5CAE9 {
+  * id : bigint <<PK>>
+  --
+  **UK** (activity_id, sku_id)
+  # activity_id, # sku_id
+  seckill_price  服务端唯一价格来源
+  **total_stock**  活动总库存
+  **available_stock**  扣减目标
+  **locked_stock**  已下单未支付
+  **sold_stock**  已成交
+  released_stock  累计回补，对账用
+  limit_per_user : int  当前固定 1
+  status : tinyint  0=停售 1=在售 2=售罄
+  CHECK available_stock >= 0
+}
+
+note right of goods
+  **库存三分口径**（与 docs/02 原稿的偏差）
+  下单 available→locked、支付 locked→sold、
+  取消 locked→available，恒有
+  **total = available + locked + sold**
+  每个集成测试都断言这条等式。
+
+  原稿「available-=q, sold+=q」与支付时的
+  moveLockedToSold 冲突，照原样实现
+  会在支付时把 sold 加两次。
+
+  status=2 售罄与 status=0 停售**必须分开**：
+  合并后活动一售罄，用户看到的提示是「商品已停售」
+end note
+
+' ------------------------------------------------ 订单链
+entity "**t_order**\n秒杀订单" as ord #E1F5FE {
+  * id : bigint <<PK>>
+  --
+  **UK** order_no        ← 订单号碰撞兜底
+  **UK** request_no      ← **MQ 重复投递 / 消费重试**
+  **UK** (activity_id, sku_id, user_id)\n  ← **Redis 数据丢失后重抢**
+  # user_id, # activity_id, # sku_id
+  status : tinyint\n  0=待支付 1=已支付 2=已取消\n  3=已完成 4=退款中 5=已退款
+  total_amount, pay_amount : decimal
+  **stock_released** : tinyint  回补幂等
+  **expire_time**  ← 定时消息的投递时刻
+  pay_time, cancel_time, finish_time
+}
+
+note right of ord
+  三个唯一键**各拦一类异常**，缺一不可。
+  它们是幂等 **L2** 的物理载体 ——
+  L1（先查一次）挡掉 99% 的重复，
+  但并发窗口只有数据库能关上。
+
+  expire_time 直接当定时消息的投递时刻：
+  取「现在+15min」的话，消息重试导致的延迟
+  会顺延关单时刻
+end note
+
+entity "**t_order_item**\n订单明细（全字段快照）" as item #E1F5FE {
+  * id : bigint <<PK>>
+  --
+  # order_no : varchar(40)
+  # sku_id, # product_id
+  product_title  快照
+  spec_snapshot  快照
+  unit_price  成交单价快照
+}
+
+entity "**t_payment**\n支付流水" as pay #E1F5FE {
+  * id : bigint <<PK>>
+  --
+  **UK** pay_no
+  **UK** out_trade_no   ← 渠道回调幂等
+  # order_no, # user_id
+  amount : decimal(12,2)
+  channel : 0=模拟 1=支付宝 2=微信
+  status : 0=待支付 1=成功 2=失败 3=已退款
+  notify_body : text  回调原文，审计
+}
+
+' ------------------------------------------------ 秒杀过程
+entity "**t_seckill_request**\n秒杀请求记录" as req #FFF9C4 {
+  * id : bigint <<PK>>
+  --
+  **UK** request_no
+  # user_id, # activity_id, # sku_id
+  status : tinyint\n  0=排队中 1=成功 2=库存不足\n  3=重复购买 4=创建失败 **5=已补偿**
+  order_no, fail_reason
+  **trace_id**  跨 MQ 排查用
+}
+
+' ------------------------------------------------ 可靠性三张表
+entity "**t_mq_message**\n本地消息表（决策 5）" as mq #FFE0B2 {
+  * id : bigint <<PK>>
+  --
+  **UK** msg_id
+  topic, tags, biz_key  ← biz_key 通常 = request_no
+  body : text  JSON
+  **deliver_time**  定时投递时刻，null=即时
+  status : 0=待发送 1=已发送\n  2=已消费 3=发送失败
+  send_count, next_retry_at, last_error
+  KEY (status, next_retry_at)
+}
+
+note bottom of mq
+  捞待重发记录**必须带 send_count < max 条件**。
+  「捞出来再判次数、超了就 markFailed 并跳过」的写法：
+  只要有一次 markFailed 失败（DB 抖动），
+  那条记录就永远留在 status=0，每 30 秒被捞一次、跳过一次；
+  积累几万条后每轮配额全被占满 ——
+  症状是「重发任务在跑、日志不报错、消息就是发不出去」
+end note
+
+entity "**t_stock_log**\n库存流水" as slog #FFE0B2 {
+  * id : bigint <<PK>>
+  --
+  **UK (biz_no, change_type)**  ← 库存幂等关键
+  # activity_id, # sku_id
+  change_type : 1=预扣 2=确认扣减\n  3=取消回补 4=补偿回补 5=管理调整\n  （**1 与 4 只在 Redis 侧发生，无 DB 流水**）
+  quantity : int  正=增 负=减
+  before_stock, after_stock
+}
+
+entity "**t_reconcile_task**\n对账任务" as rec #FFE0B2 {
+  * id : bigint <<PK>>
+  --
+  task_type : 1=资格 2=库存 3=支付
+  biz_no, activity_id, sku_id
+  detail : text  JSON 差异明细
+  status : 0=待处理 **1=自动修复成功**\n  **2=需人工** 3=人工已处理 4=忽略
+  handle_result, handler
+}
+
+entity "**t_admin_log**\n管理操作审计" as alog #F5F5F5 {
+  * id : bigint <<PK>>
+  --
+  # admin_id : bigint
+  action : ACTIVITY_PUBLISH / DEGRADE_SET ...
+  before_val, after_val : text
+  ip : varchar(64)
+}
+
+' ------------------------------------------------ 关系
+' 只画**单义**的一对多关系。t_stock_log.biz_no 与 t_reconcile_task.biz_no 是
+' **多态列**（可能是 request_no，也可能是 order_no），给它们各画 3 条汇入边时
+' graphviz 只能绕整张图走线，右边缘的标签会被裁掉 ——
+' 多态关系本来就不该画成 ER 边，改成下面的注释说明。
+product ||--o{ sku       : 一品多 SKU
+user   ||--o{ act        : creator_id
+act    ||--o{ goods      : 活动含多个秒杀 SKU
+sku    ||--o{ goods
+user   ||--o{ ord
+act    ||--o{ ord
+sku    ||--o{ ord
+ord    ||--|{ item       : order_no（逻辑）
+ord    ||--o{ pay        : 一单多次支付尝试
+user   ||--o{ req
+act    ||--o{ req
+req    |o--o| ord        : request_no（UK 一对一）
+user   ||--o{ alog       : admin_id
+
+note as N_POLY #FFF9C4
+  **两张表的 biz_no 是多态列，所以图上没有连线**
+
+  ""t_stock_log.biz_no"" 按 change_type 取值不同：
+  · 2 确认扣减 → **request_no**（消费端落库时，订单号还没生成）
+  · 3 取消回补 → **order_no**
+  · 5 管理调整 → ""ADJ-{goodsId}-{nanoTime}""
+  这正是 ""uk_biz_type (biz_no, change_type)"" 能同时给
+  「同一请求的确认扣减」和「同一订单的取消回补」各留一行的原因。
+
+  枚举里的 **1 预扣**与 **4 补偿回补**至今没有写入点 ——
+  这两步只发生在 Redis 里（脚本 A / 脚本 B），
+  DB 侧没有对应流水。它们不是漏写：预扣时连订单都还不存在，
+  为一个可能永不落库的预扣写一行 DB 流水，
+  等于把「异步化省下的那次写」又还回去。
+  代价是**库存流水不能独立还原 Redis 侧的历史**，
+  Redis 与 DB 的差值只能靠库存对账的第三条等式发现。
+
+  ""t_reconcile_task.biz_no"" 按 task_type 取值不同：
+  · 1 资格类 → request_no
+  · 2 库存类 → ""{activityId}:{skuId}""（不是单条业务号）
+  · 3 支付类 → **pay_no**（金额类差异用 payNo 定位流水）
+  查询一律走 ""idx_biz_no"" + task_type，不做 JOIN。
+end note
+
+N_POLY .. slog
+N_POLY .. rec
+
+legend right
+  |= 颜色 |= 分组 |
+  | <#E8EAF6> | 基础主数据 |
+  | <#C5CAE9> | 活动与库存（热点） |
+  | <#E1F5FE> | 订单与资金 |
+  | <#FFF9C4> | 秒杀过程 |
+  | <#FFE0B2> | 可靠性与对账 |
+
+  **UK** = 唯一键（幂等的物理载体）
+  # = 逻辑外键，库里**没有** FOREIGN KEY：
+  秒杀写入是热点，外键检查要额外锁父表行
+endlegend
+
+@enduml
