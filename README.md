@@ -35,6 +35,7 @@
 | 认证 | Spring Security 6 + JWT |
 | 可观测 | Micrometer + Prometheus 2.54 + Grafana 11.2 |
 | 接口文档 | Springdoc OpenAPI 2.x |
+| 演示前端 | Vue 3.5 + Vite 7 + TypeScript 5.9 + Element Plus 2.14（`fss-web/`，独立进程） |
 | 测试 | JUnit 5 + Testcontainers + JMeter |
 | 部署 | Docker Compose |
 
@@ -90,6 +91,23 @@ java -jar fss-app/target/fss-app.jar \
 - **Prometheus**：<http://localhost:9090>（`/alerts` 看 16 条告警规则的实时状态）
 - 演示账号：`admin` / `demo1` / `demo2` / `demo3`，密码统一 `Passw0rd1`
 - 启动后自动创建一个「1 分钟后开抢、库存 100、每人限 1 件」的活动并完成 Redis 预热
+
+### 5. Vue 演示控制台（可选，但演示推荐）
+
+`fss-app/src/main/resources/static/index.html` 那个单页仍然可用，只覆盖用户流程。
+`fss-web/` 是一个独立的 Vue 3 + Vite + TS + Element Plus 前端，多了管理端与链路观测：
+
+```bash
+cd fss-web
+npm install
+npm run dev          # http://localhost:5173
+```
+
+通过 Vite 代理打 8080，**后端零改动**（不开 CORS、不改过滤器白名单）；
+后端换端口用 `FSS_API=http://127.0.0.1:8081 npm run dev` 覆盖。
+四个页面分别是秒杀大厅（含抢购链路四步可视化与轮询明细）、我的订单、
+链路观测（请求时间线 + traceId + 降级状态）、管理控制台（一键造活动、预热、
+库存调整、降级等级）。细节见 [fss-web/README.md](fss-web/README.md)。
 
 **`consumer` profile 必须激活**：阶段三起订单由消费端创建，不激活它所有秒杀都会
 永远停在"排队中"。**`job` profile 决定对账、降级监控、关单扫描跑不跑**——
