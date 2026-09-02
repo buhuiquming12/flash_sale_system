@@ -394,6 +394,11 @@ Lua number 传给 `redis.call` 时用过 `%.14g` / `%.17g` 等不同格式，依
 
 用 `DefaultRedisScript` + `EVALSHA`，脚本只在首次加载时上传。
 
+> 这一句成立有个前提：脚本执行器得换成 `EvalShaScriptExecutor`。Spring 自带的执行器
+> 在 `NOSCRIPT` 之后回落 `EVAL`，而那条路会按平台默认编码把正文转一遍码，
+> 于是 Redis 缓存的 sha1 和应用发的 sha1 永远对不上，**每次调用都重传整段正文**。
+> 阶段五压测才发现，成因与修法见 [docs/09 §5](09-压测报告.md)。
+
 ```java
 @Configuration
 public class SeckillScriptConfig {

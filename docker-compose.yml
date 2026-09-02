@@ -4,18 +4,28 @@
 #
 #   （默认）  mysql
 #   phase2    redis
-#   phase3    rocketmq namesrv + broker
+#   phase3    rocketmq namesrv + broker + 建 Topic
 #   phase4    prometheus + grafana
 #   phase5    nginx（多实例部署形态才有意义）
+#   all       上面全部 + 应用容器 + 前端容器（一键演示）
 #
-# 阶段四起的常用起法：
-#   docker compose --profile phase2 --profile phase3 --profile phase4 up -d
+# 一键起整套（首次会构建应用与前端镜像，约 3~6 分钟）：
+#   docker compose --profile all up -d --build
+#   → 前端 http://localhost:8081   接口 http://localhost:8080
+#
+# 只起中间件、应用自己在宿主机 java -jar 跑（阶段四起的老流程）：
+#   FSS_BROKER_IP=127.0.0.1 docker compose \
+#       --profile phase2 --profile phase3 --profile phase4 up -d
+#
+# <b>FSS_BROKER_IP 必须显式设成 127.0.0.1</b>：broker 通过 namesrv 把自己的
+# 地址告诉客户端，默认值 rocketmq-broker 只在容器网络里解析得到。
+# 宿主机上的应用拿到这个名字会解析失败，症状是发送超时、秒杀永远停在"排队中"。
 #
 # 注意 down -v 时<b>必须带上全部 profile</b>，否则 compose 不认识那些服务，
 # 它们的命名卷会留下来：redis-data 带着上一轮的 stock/bought 活到下一轮，
 # 而 mysql-data 被删了、activityId 从 1 重新开始——两边一对上就是
 # "库存莫名少了几个"。清干净的写法：
-#   docker compose --profile phase2 --profile phase3 --profile phase4 --profile phase5 down -v
+#   docker compose --profile all --profile phase5 down -v
 # =====================================================================
 name: fss
 
@@ -56,7 +66,7 @@ services:
   redis:
     image: redis:7.2-alpine
     container_name: fss-redis
-    profiles: ["phase2"]
+    profiles: ["phase2", "all"]
     command:
       - redis-server
       - --appendonly
@@ -74,11 +84,16 @@ services:
       - redis-data:/data
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   rocketmq-namesrv:
     image: apache/rocketmq:5.3.0
     container_name: fss-rmq-namesrv
-    profiles: ["phase3"]
+    profiles: ["phase3", "all"]
     command: sh mqnamesrv
     # namesrv 默认要 -Xms4g，普通开发机上直接 OOM 起不来
     environment:
@@ -89,14 +104,22 @@ services:
   rocketmq-broker:
     image: apache/rocketmq:5.3.0
     container_name: fss-rmq-broker
-    profiles: ["phase3"]
-    command: sh mqbroker -c /home/rocketmq/conf/broker.conf
+    profiles: ["phase3", "all"]
     depends_on:
       - rocketmq-namesrv
     environment:
       JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m"
+      # broker 注册到 namesrv 的自身地址，客户端拿到它之后直连。
+      # 默认给容器名（应用也在容器里跑时用这个）；应用在宿主机上跑时
+      # 必须 FSS_BROKER_IP=127.0.0.1，见文件头的说明
+      FSS_BROKER_IP: "${FSS_BROKER_IP:-rocketmq-broker}"
     volumes:
       - ./docker/rocketmq/broker.conf:/home/rocketmq/conf/broker.conf:ro
+    # broker.conf 是只读挂载的模板，启动时把 brokerIP1 那一行替换掉再用。
+    # 为两种部署形态各留一份 broker.conf 会漂移，而漂移的那一行
+    # （恰好是决定客户端能不能连上的那一行）只会在切换形态时暴露。
+    # $$ 是给 compose 转义用的，容器里看到的是 $FSS_BROKER_IP
+    command: sh -c 'sed "s|^brokerIP1 *=.*|brokerIP1 = $$FSS_BROKER_IP|" /home/rocketmq/conf/broker.conf > /tmp/broker.conf && exec sh mqbroker -c /tmp/broker.conf'
     # 刻意<b>不</b>给 store 挂命名卷。镜像里 /home/rocketmq/store 并不存在，
     # 挂上去 Docker 会新建一个 root 所有的空目录，而 broker 以 uid 3000 运行，
     # 写不进去 → 初始化失败。更糟的是 5.3.0 的失败路径本身有个 NPE
@@ -113,6 +136,31 @@ services:
       - "10911:10911"
       - "10912:10912"
 
+  # 建 Topic。broker.conf 里 autoCreateTopicEnable = false，不建就发不出消息，
+  # 而症状是发送报 "topic not exist" 或消息进了默认 8 队列的自动 Topic。
+  #
+  # 以前这一步是让人手动 docker exec 跑一次脚本，属于"文档里写了但一定有人忘"
+  # 的那类步骤——忘了之后所有秒杀都停在"排队中"，而 broker 一句错都不报。
+  # 做成一次性服务由 compose 保证它跑过，应用再用
+  # depends_on: service_completed_successfully 等它。
+  rocketmq-init:
+    image: apache/rocketmq:5.3.0
+    container_name: fss-rmq-init
+    profiles: ["phase3", "all"]
+    depends_on:
+      - rocketmq-broker
+    environment:
+      JAVA_OPT_EXT: "-Xms64m -Xmx256m -Xmn64m"
+      NAMESRV: rocketmq-namesrv:9876
+    volumes:
+      - ./docker/rocketmq/init-topics.sh:/init-topics.sh:ro
+    restart: "no"
+    # 等待与重试都在脚本里，因为 mqadmin updateTopic <b>失败时也返回 0</b>：
+    # 在 compose 这层写 `脚本 && exit 0 || 重试` 拦不住它，实测过一次
+    # 前三个 Topic 全失败而脚本退出码 0，应用照常启动然后所有秒杀卡在
+    # "排队中"。脚本改成回读 topicList 校验，见 init-topics.sh 的头注释
+    command: sh /init-topics.sh
+
   # ==================================================================
   # 阶段四：监控栈
   # ==================================================================
@@ -120,7 +168,7 @@ services:
   prometheus:
     image: prom/prometheus:v2.54.1
     container_name: fss-prometheus
-    profiles: ["phase4"]
+    profiles: ["phase4", "all"]
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       # 演示环境保 7 天够了。秒杀活动本身只有几十分钟，
@@ -143,7 +191,7 @@ services:
   grafana:
     image: grafana/grafana:11.2.0
     container_name: fss-grafana
-    profiles: ["phase4"]
+    profiles: ["phase4", "all"]
     depends_on:
       - prometheus
     environment:
@@ -161,9 +209,75 @@ services:
     ports:
       - "3000:3000"
 
+  # ==================================================================
+  # 一键演示：应用与前端也进容器（profile all）
+  #
+  # 应用只起一个容器、同时激活 web + consumer + job 三个角色。真实部署要拆
+  # （docs/08 的拓扑是 web×3 + consumer×2 + job×1），但拆开演示要开六个终端看日志，
+  # 而这个项目要演示的是链路而不是部署形态。要看多实例的行为用 phase5 那套。
+  # ==================================================================
+
+  app:
+    build:
+      # 上下文是仓库根目录：应用镜像要编译全部五个模块
+      context: .
+      dockerfile: fss-app/Dockerfile
+    image: fss-app:local
+    container_name: fss-app
+    profiles: ["all"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # 等 Topic 真的建好再启动。不等的话消费者会订阅一个不存在的 Topic，
+      # 之后即使 Topic 建好了，这一轮的订阅关系也已经错了
+      rocketmq-init:
+        condition: service_completed_successfully
+    environment:
+      # consumer 必须激活：阶段三起订单由消费端创建，不激活所有秒杀都停在"排队中"。
+      # job 决定对账、降级监控、关单扫描跑不跑。dev 建演示数据并开放 mock-sign
+      SPRING_PROFILES_ACTIVE: web,consumer,job,dev
+      # 必须显式指定：application-job.yml 里设了 8099、consumer 设了 8090，
+      # profile 顺序靠后的会覆盖前面的。环境变量优先级高于两者
+      SERVER_PORT: 8080
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/flash_sale?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true&useSSL=false"
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      FSS_REDIS_HOST: redis
+      FSS_REDIS_PORT: 6379
+      FSS_MQ_NAMESRV: rocketmq-namesrv:9876
+      # 演示环境用默认弱密钥。生产必须由外部注入，见 application.yml 的注释
+      FSS_JWT_SECRET: fss-local-dev-only-secret-change-me-in-prod
+      FSS_PAY_SECRET: fss-mock-pay-secret-change-me
+      TZ: Asia/Shanghai
+    ports:
+      # 端口留在宿主机上不只是为了 curl 调试：prometheus.yml 抓的是
+      # host.docker.internal:8080，靠这个映射在"应用在容器里"和
+      # "应用在宿主机上"两种形态下都能命中同一个 target
+      - "8080:8080"
+    stop_grace_period: 30s
+
+  ui:
+    build:
+      context: ./fss-web
+    image: fss-ui:local
+    container_name: fss-ui
+    profiles: ["all"]
+    depends_on:
+      app:
+        condition: service_started
+    # 8081 而不是 5173：5173 留给 npm run dev。改前端时常见的用法是
+    # 容器里跑后端、宿主机跑 Vite 热更新，两个端口不撞才能同时开着
+    ports:
+      - "8081:80"
+
   # 四级限流的第一级。只在多实例部署形态下才有意义（它要 proxy_pass 到
   # fss-web-1 / fss-web-2 两个容器），本地开发时应用跑在宿主机上，
   # 所以放在 phase5 profile 里默认不启动。配置本身见 docker/nginx/nginx.conf
+  #
+  # 注意它 upstream 里的 fss-web-1/2 指的是<b>应用的 web 角色实例</b>，
+  # 和前端模块 fss-web/ 没有关系——前端容器叫 fss-ui
   nginx:
     image: nginx:1.27-alpine
     container_name: fss-nginx

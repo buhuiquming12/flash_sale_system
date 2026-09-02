@@ -33,36 +33,20 @@ import java.util.List;
  * 而脚本在打进 jar 之后不可能变。用 {@code setScriptText} 在启动时读一次、
  * 之后 SHA1 与正文都来自同一个不变的字符串，少一层不确定性。
  *
- * <h3>已知问题：EVALSHA 目前 100% 回落 EVAL（未解决）</h3>
+ * <h3>EVALSHA 曾经 100% 回落 EVAL（已修，成因不在本类）</h3>
  * 阶段五压测实测：一次秒杀请求发出 <b>2 次 EVALSHA（全部 NOSCRIPT）+ 4 次 EVAL</b>，
- * Redis {@code errorstat_NOSCRIPT} 与 {@code cmdstat_evalsha.failed_calls} 同步增长。
- * 后果是每次 Lua 调用多一个 RTT 并重传整段脚本正文（本脚本 3.4KB）。
+ * {@code errorstat_NOSCRIPT} 与 {@code cmdstat_evalsha.failed_calls} 同步增长，
+ * 每次 Lua 调用都多一个 RTT 并重传整段正文。功能完全正确、无日志无告警，
+ * 典型的静默性能退化。
  *
- * <p><b>功能完全正确</b>——回落路径就是为此设计的，所有集成用例照常通过。
- * 它只影响性能，且不产生任何日志或告警，属于典型的静默退化。
- *
- * <p>已排除的四个假设（都有实测数据）：
- * <ol>
- *   <li><b>尾部换行差异</b>：Redis 对 jar 内文件原字节算出的 sha1hex
- *       与 {@code getSha1()} <b>完全相等</b>（都是 {@code 085cbf12...}）。
- *       早先看到的 {@code 66a826d3...} 是排查时
- *       {@code SCRIPT LOAD "$(cat file)"} 里 shell 的 {@code $()} 剥掉尾换行造成的，
- *       是排查动作的产物，不是应用行为。</li>
- *   <li><b>编码不一致</b>：平台默认编码是 GBK，但 {@code getSha1()} 实测等于
- *       sha1(UTF-8 正文)，GBK 变体的 sha1 是另一个值且不在缓存里。</li>
- *   <li><b>CRLF</b>：{@code core.autocrlf=true}，但 jar 内该文件是纯 LF。</li>
- *   <li><b>有人清了脚本缓存</b>：MONITOR 抓 10 秒空闲期，无
- *       {@code SCRIPT FLUSH / FLUSHALL / FLUSHDB}。</li>
- * </ol>
- * 而 {@code redis-cli --eval} 发同一份文件后 {@code SCRIPT EXISTS 085cbf12...}
- * 立刻变 1，说明 Redis 侧的 EVAL 隐式缓存与 SHA 计算都正常。
- * 所以问题出在 Spring Data Redis / Lettuce 发出 {@code EVAL} 时的正文与
- * {@code getSha1()} 所基于的正文之间——还没找到那个差异点。
- *
- * <p>{@link com.fss.metrics.LuaScriptShaTest} 已经把
- * 「{@code getSha1()} == sha1(getScriptAsString())」钉住，
- * 排除了本类这一侧的成因；剩下的要往 {@code DefaultScriptExecutor.scriptBytes()}
- * 与连接层的序列化器去查。
+ * <p>成因是 Spring Data Redis 回落 {@code EVAL} 时把正文按<b>平台默认编码</b>
+ * 解码再按 UTF-8 编回（{@code LettuceConverters.toString(byte[])} 是
+ * {@code new String(bytes)}），GBK 下这个来回有损：Redis 隐式缓存到
+ * {@code c9367cb8…}，而应用发的是 {@code 085cbf12…}。
+ * 本类这一侧从头到尾都是对的——{@code getSha1()} 实测等于 sha1(UTF-8 正文)，
+ * 也等于 Redis 对文件原字节算出的值，所以当初「编码不一致」这个假设被误判成排除了：
+ * 错的不是 SHA1，是发正文的那条路。详见 {@link EvalShaScriptExecutor}，
+ * 它换成用 {@code SCRIPT LOAD} 上传正文（不经 String 中转）。
  */
 @Configuration
 public class LuaScriptConfig {
@@ -102,8 +86,8 @@ public class LuaScriptConfig {
      * 读脚本文件并显式 setScriptText。
      *
      * <p>不用 {@code setScriptSource(new ResourceScriptSource(...))} 的原因见类注释：
-     * 那条路径下 SHA1 的计算与正文的上传用的不是同一个字符串，
-     * {@code EVALSHA} 永远命中不了。
+     * 那条路径每次 {@code getSha1()} 都要问一次 {@code isModified()}，
+     * 而这里读进来的字符串此后不会再变。
      *
      * <p>启动时读一次、失败即启动失败。让它在启动时炸掉而不是运行时静默降级：
      * 少一个脚本意味着对应的那条链路完全不可用，

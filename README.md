@@ -64,48 +64,80 @@
 
 ## 快速开始
 
+### 方式一：Docker 一键起（推荐，只需要 Docker）
+
+```bash
+docker compose --profile all up -d --build
+```
+
+一条命令按顺序拉起：MySQL（首次自动执行 `sql/V1__init.sql` 建表）→ Redis →
+RocketMQ namesrv + broker → **自动建好 4 个 Topic** → 应用容器
+（`web,consumer,job,dev` 单进程）→ 前端容器 → Prometheus + Grafana。
+首次要构建应用与前端镜像（Maven 拉依赖 + `npm ci`），约 3~6 分钟；之后再起是秒级。
+
+| 入口 | 地址 |
+| --- | --- |
+| **Vue 演示控制台** | <http://localhost:8081> |
+| 内置单页演示（只有用户流程） | <http://localhost:8080/index.html> |
+| 接口文档 | <http://localhost:8080/swagger-ui.html> |
+| **Grafana 看板** | <http://localhost:3000>（匿名可看，打开即是「秒杀系统总览」） |
+| **Prometheus** | <http://localhost:9090/alerts>（16 条告警规则的实时状态） |
+
+演示账号 `admin` / `demo1` / `demo2` / `demo3`，密码统一 `Passw0rd1`；
+启动后自动创建一个「1 分钟后开抢、库存 100、每人限 1 件」的活动并完成 Redis 预热。
+
+```bash
+docker compose --profile all ps          # 看各容器健康状态
+docker compose --profile all logs -f app # 跟应用日志（演示数据就绪的横幅在这里）
+docker compose --profile all stop        # 停但留数据
+```
+
+**如果所有秒杀都停在"排队中"**，先看建 Topic 那一步：
+
+```bash
+docker logs fss-rmq-init      # 结尾应当是「四个 Topic 都已就绪」
+```
+
+`mqadmin updateTopic` <b>失败时也返回退出码 0</b>——broker 还没注册到 namesrv 时
+它只打一行 `[error] Make sure the specified clusterName exists ...` 然后正常退出。
+所以 `init-topics.sh` 不看退出码，而是回读 `topicList` 确认四个 Topic 都在，
+不齐就整轮重来。这个坑实测踩过一次：四个里前三个建失败、脚本退出码 0、
+应用照常启动，日志里只有一句 `No route info of this topic: FSS_ORDER_CREATE`。
+
+### 方式二：中间件在容器、应用在宿主机（改后端代码时用）
+
 需要 JDK 17、Maven 3.9+、Docker。
 
 ```bash
-# 1. 起 MySQL、Redis、RocketMQ、Prometheus、Grafana
-#    （MySQL 首次启动会自动执行 sql/V1__init.sql 建表）
-docker compose --profile phase2 --profile phase3 --profile phase4 up -d
+# FSS_BROKER_IP 必须显式设成 127.0.0.1：broker 注册给客户端的地址
+# 默认是容器名 rocketmq-broker，宿主机上的应用解析不了它，
+# 症状是发送超时、所有秒杀永远停在"排队中"
+FSS_BROKER_IP=127.0.0.1 docker compose \
+  --profile phase2 --profile phase3 --profile phase4 up -d
 
-# 2. 建 Topic（autoCreateTopicEnable=false，必须显式创建；只需在 broker 首次起来后做一次）
-docker cp docker/rocketmq/init-topics.sh fss-rmq-broker:/home/rocketmq/init-topics.sh
-docker exec fss-rmq-broker sh /home/rocketmq/init-topics.sh
-
-# 3. 打包
 mvn clean package -DskipTests
 
-# 4. 启动（web + consumer + job 单进程，dev profile 会初始化演示数据）
 java -jar fss-app/target/fss-app.jar \
   --spring.profiles.active=web,consumer,job,dev \
   --server.port=8080 \
   --spring.datasource.url='jdbc:mysql://127.0.0.1:3307/flash_sale?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false'
 ```
 
-- 演示页面：<http://localhost:8080/index.html>
-- 接口文档：<http://localhost:8080/swagger-ui.html>
-- **Grafana 看板**：<http://localhost:3000>（匿名可看，打开即是「秒杀系统总览」）
-- **Prometheus**：<http://localhost:9090>（`/alerts` 看 16 条告警规则的实时状态）
-- 演示账号：`admin` / `demo1` / `demo2` / `demo3`，密码统一 `Passw0rd1`
-- 启动后自动创建一个「1 分钟后开抢、库存 100、每人限 1 件」的活动并完成 Redis 预热
+Topic 不需要手动建了：`rocketmq-init` 这个一次性服务会带重试地建好那 4 个
+Topic，应用用 `depends_on: service_completed_successfully` 等它跑完。
+以前这一步靠文档提醒人手动 `docker exec`，忘了之后 broker 一句错都不报，
+所有秒杀都停在"排队中"。
 
-### 5. Vue 演示控制台（可选，但演示推荐）
-
-`fss-app/src/main/resources/static/index.html` 那个单页仍然可用，只覆盖用户流程。
-`fss-web/` 是一个独立的 Vue 3 + Vite + TS + Element Plus 前端，多了管理端与链路观测：
+### 前端单独起（改前端时用，有热更新）
 
 ```bash
-cd fss-web
-npm install
-npm run dev          # http://localhost:5173
+cd fss-web && npm install && npm run dev   # http://localhost:5173
 ```
 
-通过 Vite 代理打 8080，**后端零改动**（不开 CORS、不改过滤器白名单）；
-后端换端口用 `FSS_API=http://127.0.0.1:8081 npm run dev` 覆盖。
-四个页面分别是秒杀大厅（含抢购链路四步可视化与轮询明细）、我的订单、
+`fss-web/` 是 Vue 3 + Vite + TS + Element Plus。开发时用 Vite 代理打 8080，
+容器里用同镜像内的 Nginx 反代到 `app:8080`——**两种模式后端都零改动**
+（不开 CORS、不改过滤器白名单）。后端换端口用 `FSS_API=http://127.0.0.1:8082 npm run dev`。
+四个页面：秒杀大厅（含抢购链路四步可视化与轮询明细）、我的订单、
 链路观测（请求时间线 + traceId + 降级状态）、管理控制台（一键造活动、预热、
 库存调整、降级等级）。细节见 [fss-web/README.md](fss-web/README.md)。
 
@@ -115,6 +147,7 @@ npm run dev          # http://localhost:5173
 
 注意 `server.port` 必须显式指定：`application-job.yml` 里设了 8099、
 `application-consumer.yml` 设了 8090，profile 顺序靠后的会覆盖前面的。
+容器里是用 `SERVER_PORT` 环境变量压过去的（环境变量优先级高于 profile 配置文件）。
 
 `docker compose down -v` **必须带上全部 profile**，否则 compose 不认识那些服务，
 它们的命名卷会留下来：`redis-data` 带着上一轮的 `stock`/`bought` 活到下一轮，
@@ -122,7 +155,7 @@ npm run dev          # http://localhost:5173
 清干净的写法：
 
 ```bash
-docker compose --profile phase2 --profile phase3 --profile phase4 --profile phase5 down -v
+docker compose --profile all --profile phase5 down -v
 ```
 
 Redis 地址默认 `127.0.0.1:6379`，可用 `FSS_REDIS_HOST` / `FSS_REDIS_PORT` 覆盖；
@@ -160,6 +193,8 @@ mvn clean verify
 | `MetricsTest` | 关键指标存在、失败原因用标签、**标签基数有界**（禁 userId/requestNo）、告警指标形状 |
 | `MetricsExportTest` | **导出文本**里的指标名与告警规则/看板逐一对齐（不需要容器，毫秒级） |
 | `LuaScriptShaTest` | `getSha1()` == `sha1(正文)`、正文未被 trim、五脚本互不相同（阶段五压测抓到 EVALSHA 缺陷后补的，不需要容器） |
+| `EvalShaScriptExecutorTest` | 补一次缓存后 EVALSHA 命中且**一次 EVAL 都不发**、用假连接复现原缺陷、执行器真的装到了 `StringRedisTemplate` 上（不需要容器） |
+| `LuaScriptCacheTest` | 真 Redis：每个脚本 `SCRIPT LOAD` 回来的 sha1 == `getSha1()`、冷缓存补一次后 `errorstat_NOSCRIPT` 不再增长 |
 | `SeckillRedisStockTest` | 取消回补 Redis 库存但保留资格、重复回补幂等、确定性失败不归还资格、售罄标记复位 |
 | `WarmupTest` | 重复预热不重置库存、元数据可覆盖、已结束活动预热不崩、`warmup_state` 置位、关闭活动同步 Redis |
 | `ActivityCacheTest` | 缓存命中、`serverTime`/库存不被缓存、空值缓存、逻辑过期后台重建、管理操作失效缓存、脏缓存自愈 |
@@ -197,12 +232,16 @@ mvn clean verify
 
 这是阶段五最有价值的产出，三个都是前四阶段的测试**发现不了**的类型：
 
-1. **EVALSHA 100% 回落 EVAL**（性能，未根治）。一次秒杀请求发 2 次 `EVALSHA`
-   （全部 NOSCRIPT）+ 4 次 `EVAL`，每次重传 3.4KB 脚本正文。
+1. **EVALSHA 100% 回落 EVAL**（性能，已修）。一次秒杀请求发 2 次 `EVALSHA`
+   （全部 NOSCRIPT）+ 4 次 `EVAL`，每次重传 5032 字节脚本正文。
    **功能完全正确、无日志无告警、所有测试全绿**——只有压测能发现。
-   已排除尾换行/编码/CRLF/缓存被清四个假设（都有实测数据），
-   改用 `setScriptText` 后失败率从 100% 降到 50.6%，成因仍在查。
-   新增 `LuaScriptShaTest` 把装配侧钉死，排除了这一类成因。
+   根因是 Spring Data Redis 回落 `EVAL` 时把正文按平台默认编码（GBK）解码、再按 UTF-8 编回
+   （`LettuceConverters.toString(byte[])` 就是 `new String(bytes)`），
+   于是 Redis 隐式缓存的是 `c9367cb8…`，而应用发的是 `085cbf12…`，永远对不上；
+   而「编码不一致」这个假设当初被误判成排除了——`getSha1()` 等于 sha1(UTF-8 正文) 只能说明
+   算 SHA1 的那一侧无罪。修法是 `EvalShaScriptExecutor`：`NOSCRIPT` 后用
+   `SCRIPT LOAD`（字节原样直传）补缓存再重试，不走 `EVAL`，与平台编码无关。
+   实测 100 次调用的 NOSCRIPT 从 100 降到 1、EVAL 从 100 降到 0。
 2. **`FLUSHDB` 会把全站用户登出**（影响面）。JWT 白名单 `jwt:active:{jti}`
    与秒杀数据共享同一个 Redis 实例和 DB 编号，
    于是"秒杀数据丢失"连带"所有人重新登录"。演练时这一点先把我拦住了。
@@ -222,7 +261,6 @@ mvn clean verify
   真机 `THREADS=10000 ./run.sh S2` 直接压满。报告里两列并排、不包装。
 - **S6 消费端吞吐（≥500 TPS/实例）未测**。消费端 12 线程 × 跨 WSL2 的 4 表事务，
   本机上限远低于 500，测出来的数字只反映 WSL2 网络。**没测就没写数字。**
-- **EVALSHA 仍有约 50% 回落 EVAL**（见上文「三个真问题」）。只影响性能不影响正确性。
 - **`MetricsTest.M1` 改成只断言「指标已注册」而不断言具体计数**。
   原本按 `(activity, sku)` 断言 =1.0，整套跑时 4 轮里失败 3 轮、单跑从不失败：
   该活动的序列压根没被创建，说明那一单是 `duplicate=true` 建的

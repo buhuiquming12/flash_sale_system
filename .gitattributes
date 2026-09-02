@@ -1,0 +1,13 @@
+# 行尾统一。
+#
+# 仓库在 Windows 上开发（core.autocrlf=true），但下面这些文件会被挂进
+# Linux 容器里执行或解析——CRLF 会让 sh 报 `set -e\r: not found` 这类
+# 完全看不出原因的错，而 broker.conf 里带 \r 的值会被原样注册到 namesrv。
+#
+# .gitattributes 的优先级高于 core.autocrlf，所以不管克隆者本机怎么配，
+# 这些文件在工作区里都是 LF。
+*.sh                text eol=lf
+Dockerfile          text eol=lf
+docker/**           text eol=lf
+fss-web/nginx.conf  text eol=lf
+docker-compose.yml  text eol=lf

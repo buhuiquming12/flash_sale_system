@@ -20,16 +20,20 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <h3>这个类防的是什么</h3>
  * 阶段五压测实测到一个**静默性能退化**：一次秒杀请求发出
  * 2 次 {@code EVALSHA}（全部 NOSCRIPT）+ 4 次 {@code EVAL}，
- * 每次 Lua 调用都多一个 RTT 并重传整段脚本正文（seckill.lua 有 3.4KB）。
+ * 每次 Lua 调用都多一个 RTT 并重传整段脚本正文（seckill.lua 有 5032 字节）。
  * 功能完全正确——回落到 EVAL 本来就是设计好的兜底，所有集成用例照常通过，
  * 也没有任何日志或告警。
  *
- * <p>这个类**不负责修那个缺陷**（成因还在查，见 {@link LuaScriptConfig} 的类注释），
- * 它负责把「本类这一侧」永久钉住：
+ * <p>成因<b>不在这一侧</b>：是 Spring Data Redis 回落 {@code EVAL} 时按平台默认编码
+ * 把正文转了一次（见 {@code EvalShaScriptExecutor} 的类注释，那里已经修掉）。
+ * 本类钉住的是装配侧的等式：
  * <b>{@code getSha1()} 必须等于 {@code sha1(getScriptAsString())}</b> ——
- * 这正是 Redis 那边成立的等式，Redis 对脚本原字节算出的 sha1hex
- * 实测就等于这个值。有了它，排查时可以直接排除
- * 「装配侧算错了 SHA」这一类成因，把范围缩到执行器与连接层。
+ * 这正是 Redis 那边成立的等式，Redis 对脚本原字节算出的 sha1hex 实测就等于这个值。
+ * 排查当时正是靠它把范围缩到执行器与连接层的；现在它继续防装配侧的回归。
+ *
+ * <p>另外两个用例覆盖别的层：{@code EvalShaScriptExecutorTest} 用假连接钉住
+ * 「NOSCRIPT 之后走 SCRIPT LOAD 而不是 EVAL」，{@code LuaScriptCacheTest} 用真 Redis
+ * 钉住「一次调用之后 SCRIPT EXISTS 命中」。
  *
  * <p>顺带防住两类回归：把 {@code setScriptText} 改回
  * {@code setScriptSource(ResourceScriptSource)} 之后正文被 trim（L2），

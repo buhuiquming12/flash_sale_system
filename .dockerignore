@@ -1,0 +1,24 @@
+# 应用镜像的构建上下文只需要 pom 与 java 源码。
+# 排除掉的这些要么是构建产物（每次都不一样，会让镜像层缓存永远失效），
+# 要么是几百 MB 的无关内容（.git、前端 node_modules、压测结果）。
+#
+# 注意：这个文件只作用于根目录为上下文的构建（fss-app 镜像）。
+# 前端镜像的上下文是 ./fss-web，用的是 fss-web/.dockerignore。
+
+.git
+.gitignore
+.idea
+.tools
+
+**/target
+logs
+perf/results
+docs
+sql/*.md
+
+# 前端有自己的镜像，不参与后端构建
+fss-web
+
+**/node_modules
+**/dist
+**/*.log

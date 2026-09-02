@@ -1,0 +1,29 @@
+# EVALSHA 缺陷的修复验证
+#
+# 环境：真 Redis 7.2-alpine + 真 Lettuce/Spring 栈；JVM 不加 -Dfile.encoding，
+#       默认编码 GBK（与阶段五压测时一致，那次压测的应用不是跑在容器里）。
+# 方法：同一份 seckill.lua（getSha1() = 085cbf12158ab9f9416741de9df852cc5afc4003）
+#       连调 100 次；每段之前先 SCRIPT FLUSH + CONFIG RESETSTAT。
+#       两段的脚本返回值都是 [-1, 0]，功能完全一致。
+
+## 修复前：Spring DefaultScriptExecutor（NOSCRIPT 回落 EVAL）
+cmdstat_evalsha:calls=100,usec=269,usec_per_call=2.69,rejected_calls=0,failed_calls=100
+cmdstat_eval:calls=100,usec=2163,usec_per_call=21.63,rejected_calls=0,failed_calls=0
+errorstat_NOSCRIPT:count=100
+SCRIPT EXISTS 085cbf12158ab9f9416741de9df852cc5afc4003 -> 0
+
+## 修复后：EvalShaScriptExecutor（NOSCRIPT 走 SCRIPT LOAD 后重试）
+cmdstat_evalsha:calls=101,usec=1992,usec_per_call=19.72,rejected_calls=0,failed_calls=1
+cmdstat_script|load:calls=1,usec=121,usec_per_call=121.00,rejected_calls=0,failed_calls=0
+errorstat_NOSCRIPT:count=1
+SCRIPT EXISTS 085cbf12158ab9f9416741de9df852cc5afc4003 -> 1
+# cmdstat_eval 整段缺失 —— 100 次调用里一次 EVAL 都没发出
+
+## 每次 Lua 调用的代价（上面两段相除得到）
+# 修复前：2 次 Redis 往返，Redis 侧 CPU 2.69 + 21.63 = 24.32 usec，正文重传 100 次
+# 修复后：1 次 Redis 往返，Redis 侧 CPU 19.72 usec，正文只上传 1 次
+
+## 真正上线的字节（同一份 seckill.lua，用只讲 RESP2 的假服务器抓的实际请求）
+# 修复前 EVAL 正文        6337 字节  sha1=c9367cb8f86056f1a2c79d53d91a02e75e4566c2
+# 修复后 SCRIPT LOAD 正文 5032 字节  sha1=085cbf12158ab9f9416741de9df852cc5afc4003 == getSha1()
+# 6337 > 5032 就是那次「按 GBK 解码再按 UTF-8 编回」的膨胀，也是 EVALSHA 永远命中不了的原因
