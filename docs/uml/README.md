@@ -10,7 +10,7 @@
 | 超时关单 | [04-时序-超时关单.puml](04-时序-超时关单.puml) | DB 回补同事务、Redis 回补走消息 | `OrderCloseListener` / `StockReleaseService` |
 | 补偿与对账 | [05-时序-补偿与对账.puml](05-时序-补偿与对账.puml) | `checkUncertain` + 三类对账 + 自动降级 | `UncertainCheckJob` / `reconcile/*` / `DegradeMonitorJob` |
 | 订单状态机 | [06-订单状态机.puml](06-订单状态机.puml) | 7 条合法迁移，29 条拒绝 | `OrderStateMachine` |
-| 数据模型 ER | [07-ER图.puml](07-ER图.puml) | 12 张表、全部唯一键、库存三分口径 | `sql/V1__init.sql` |
+| 数据模型 ER | [07-ER图.puml](07-ER图.puml) | 13 张表、全部唯一键、库存三分口径 | `sql/V1__init.sql` |
 
 ## 重新出图
 

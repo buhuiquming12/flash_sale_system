@@ -1,6 +1,6 @@
 @startuml 01-架构图
 ' ============================================================================
-' 总体架构图 —— 对应 docs/00-设计总览.md §3
+' 总体架构图 —— 对应 docs/00-设计总览.md §2
 '
 ' 用 Smetana 布局（PlantUML 内置的 graphviz Java 移植），出图不需要本机装 graphviz。
 '
@@ -35,7 +35,7 @@ skinparam queue {
 
 title 秒杀系统总体架构（阶段一~四实现范围）
 
-rectangle "**客户端**\n演示页 / JMeter" as client #F5F5F5
+rectangle "**客户端**\nfss-web（Vue 3 SPA，Nginx 发静态并反代 /api）/ JMeter" as client #F5F5F5
 
 rectangle "**Nginx**\nlimit_req 单 IP 限流 · 负载均衡到 2 个 web 实例" as nginx #ECEFF1
 
@@ -50,7 +50,7 @@ together {
 
   queue "**RocketMQ 5.3**\n——\nORDER_CREATE ×16 队列\nORDER_CLOSE（任意时刻定时）\nSTOCK_RELEASE ×4\nSTOCK_ROLLBACK ×4\n%DLQ%GID_FSS_ORDER_CREATE\n——\nautoCreateTopicEnable=false" as mq
 
-  database "**MySQL 8.0**\n——\n12 张表 · 无物理外键\n唯一键兜底 + CHECK 约束\n本地消息表 / 库存流水 / 对账任务\n——\ntotal = available + locked + sold" as mysql
+  database "**MySQL 8.0**\n——\n13 张表 · 无物理外键\n唯一键兜底 + CHECK 约束\n本地消息表 / 库存流水 / 对账任务\n——\ntotal = available + locked + sold" as mysql
 }
 
 rectangle "**consumer 实例 ×2**（订单在这里诞生）" as consumer #E8F5E9 {

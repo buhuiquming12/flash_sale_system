@@ -451,8 +451,8 @@ public class SeckillExecutor {
 预热任务在活动开始前 `warmup-ahead`（默认 5 分钟）执行，由 job 角色触发。
 
 ```java
-@Scheduled(cron = "0 */1 * * * ?")
-@DistributedLock(key = "job:warmup", waitTime = 0, leaseTime = 120)
+@Scheduled(cron = "${fss.job.warmup-cron:0 * * * * ?}")
+@DistributedLock(key = "warmup", leaseSeconds = 120)
 public void warmup() {
     LocalDateTime deadline = LocalDateTime.now().plus(props.getSeckill().getWarmupAhead());
     List<SeckillActivity> list = activityMapper.selectReadyBefore(deadline);
