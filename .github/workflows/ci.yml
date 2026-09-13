@@ -1,0 +1,149 @@
+# =====================================================================
+# CI。
+#
+# 三个 job 并行，各自独立不传 artifact：
+#   fast        编译 + 5 个快测 + 打包，不碰 Docker，~2 分钟
+#   frontend    npm ci + vue-tsc + vite build，~1.5 分钟
+#   integration mvn verify 全量，起 MySQL + Redis + RocketMQ 三套容器，~10~15 分钟
+#
+# integration 会把 fast 那 5 个快测再跑一遍（毫秒级）。多这一次的代价远小于
+# 在两个 job 之间传 target/ 的复杂度，而且两个 job 谁先挂都能单独定位。
+# =====================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支上新的 push 取消还在跑的旧 run。集成测试单次十几分钟，
+# 不取消的话连续几个 commit 会把并发额度占满
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ---------------------------------------------------------------
+  # 这一行是整个 workflow 里最要紧的配置，不是可选项。
+  #
+  # GitHub runner 默认 UTC，而 IntegrationTestBase 给 MySQL 容器强制了
+  # --default-time-zone=+08:00（与 docker-compose 保持一致）。不设 TZ 时
+  # SELECT NOW(3) 返回的是 +08:00 墙钟、LocalDateTime.now() 返回的是 UTC 墙钟，
+  # DatabaseTimezoneTest 会算出 28800 秒偏差，三个用例全红——而那个类本来
+  # 就是为了抓这个 8 小时错位才写的回归测试。
+  # 应用容器在 docker-compose 里同样设了 TZ: Asia/Shanghai。
+  # ---------------------------------------------------------------
+  TZ: Asia/Shanghai
+
+jobs:
+  # -------------------------------------------------------------------
+  # 快测：不需要 Docker，PR 上几分钟内就能知道有没有把编译或状态机改坏
+  # -------------------------------------------------------------------
+  fast:
+    name: 编译 + 快测
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      # -DskipITs 只跳过 failsafe，surefire 的快测照跑。
+      # 走 verify 而不是 test 是为了连打包一起验，Dockerfile 里跑的正是 package
+      - name: 快测 + 打包
+        run: mvn -B --no-transfer-progress verify -DskipITs
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fast-test-reports
+          path: '**/target/surefire-reports/'
+          retention-days: 7
+
+  # -------------------------------------------------------------------
+  # 前端：npm run build 内含 vue-tsc --noEmit，类型错误会让这一步失败
+  # -------------------------------------------------------------------
+  frontend:
+    name: 前端构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: fss-web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 Node 24
+        uses: actions/setup-node@v4
+        with:
+          # 与 fss-web/Dockerfile 的 node:24-alpine 对齐。两边漂开的话，
+          # CI 绿了但镜像构建挂，而那是部署当天才会发现的
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: fss-web/package-lock.json
+
+      # npm ci 而不是 install：严格按 package-lock.json 装，
+      # 保证 CI 装的和 Dockerfile 里装的是同一批版本
+      - name: 装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 类型检查 + 构建
+        run: npm run build
+
+  # -------------------------------------------------------------------
+  # 集成测试：18 个类跑在真 MySQL / 真 Redis / 真 RocketMQ 上
+  #
+  # ubuntu-latest 自带 Docker，Testcontainers 开箱即用，不需要任何 service 容器
+  # ——容器的生命周期由 IntegrationTestBase 自己管，Ryuk 在 JVM 退出时清理。
+  # 基类里的 withReuse(true) 在 runner 上没有 ~/.testcontainers.properties，
+  # 会打一行 warning 后降级为不复用，不影响正确性。
+  # -------------------------------------------------------------------
+  integration:
+    name: 集成测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      # 显式先拉三个镜像：Testcontainers 自己也会拉，但那时拉的日志混在
+      # 测试输出里，而且拉镜像的时间会算进容器启动的 3 分钟等待窗口。
+      # 先拉完再跑，超时就是真的超时
+      - name: 预拉测试镜像
+        run: |
+          docker pull mysql:8.0
+          docker pull redis:7.2-alpine
+          docker pull apache/rocketmq:5.3.0
+
+      - name: 全量测试
+        run: mvn -B --no-transfer-progress verify
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-reports
+          path: |
+            **/target/surefire-reports/
+            **/target/failsafe-reports/
+          retention-days: 7
+
+      - name: 上传覆盖率报告
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jacoco-report
+          # jacoco/ 是单模块报告，jacoco-aggregate/ 是 fss-app 出的跨模块汇总
+          path: '**/target/site/jacoco*/'
+          retention-days: 7

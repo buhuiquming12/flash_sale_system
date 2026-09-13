@@ -14,6 +14,31 @@
     <description>可执行入口：Controller、Web/Security 配置。</description>
 
     <dependencies>
+        <!--
+            四个兄弟模块<b>逐个显式声明</b>，不靠 fss-biz 的传递依赖。
+
+            fss-app 的主源码直接 import 了它们各自的类（fss-common 10 个、
+            fss-infra 4 个、fss-domain 2 个、fss-biz 29 个），"用到就声明"是
+            dependency:analyze 的基本规则：靠传递依赖拿到的类，一旦 fss-biz
+            哪天不再依赖 fss-infra，编译就在 fss-app 这里断掉，而报错位置
+            和真正的改动点隔着两个模块。
+
+            顺带让 jacoco 的 report-aggregate 能看全：那个 goal 只按<b>直接</b>
+            声明的依赖收集 class 文件，少声明一个，该模块就整个不出现在
+            汇总报告里（见下面 build 段的注释）。
+        -->
+        <dependency>
+            <groupId>com.fss</groupId>
+            <artifactId>fss-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fss</groupId>
+            <artifactId>fss-infra</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fss</groupId>
+            <artifactId>fss-domain</artifactId>
+        </dependency>
         <dependency>
             <groupId>com.fss</groupId>
             <artifactId>fss-biz</artifactId>
@@ -71,6 +96,49 @@
                         <goals>
                             <goal>repackage</goal>
                         </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!--
+                跨模块覆盖率汇总。
+
+                根 pom 里那份 report 只统计「本模块的类」，而本项目的测试分布和
+                代码分布是错开的：fss-infra / fss-common / fss-domain 自己一个测试
+                源码都没有，可 Lua 执行器、令牌桶、分布式锁、Redis Key 全在 fss-infra，
+                它们是被 fss-app 的集成测试跑到的。只看单模块报告，这三个模块直接
+                不出现在结果里——基线数字会明显偏低，而偏低的原因跟代码质量无关。
+
+                report-aggregate 放在 fss-app 是因为它（显式）依赖了其余四个模块：
+                该 goal 只按<b>直接声明</b>的依赖收集 class 文件——传递依赖<b>不算</b>。
+                最初只声明 fss-biz 时，汇总报告里只有 fss-biz 一个模块，
+                fss-infra / fss-common / fss-domain 连行都不出现，而这不会有任何
+                警告，看起来就像"这三个模块没有代码"。
+
+                绑在 verify 且声明在根 pom 的 merge 之后执行——它要读 merge 产出的
+                jacoco-merged.exec。输出目录与单模块报告刻意错开，两份都留着：
+                汇总看整体，单模块看"这个模块自己的测试覆盖了自己多少"。
+            -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>report-aggregate</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>report-aggregate</goal>
+                        </goals>
+                        <configuration>
+                            <!-- 默认<b>不含</b>当前模块自身，只报依赖。不打开的话
+                                 fss-app 的 Controller 与两个鉴权过滤器不在报告里，
+                                 而那正是唯一没被集成测试直接调到的一层 -->
+                            <includeCurrentProject>true</includeCurrentProject>
+                            <dataFileIncludes>
+                                <dataFileInclude>**/jacoco-merged.exec</dataFileInclude>
+                            </dataFileIncludes>
+                            <outputDirectory>${project.build.directory}/site/jacoco-aggregate</outputDirectory>
+                        </configuration>
                     </execution>
                 </executions>
             </plugin>

@@ -202,6 +202,18 @@ public class FssProperties {
         private String activityStateCron = "0 * * * * ?";
         private String warmupCron        = "0 * * * * ?";
         /**
+         * 预热并发度。
+         *
+         * <p>活动之间没有依赖，串行预热的风险随活动数线性放大：一场活动几十个
+         * SKU，每个都要一次 DB 往返加若干次 Redis 写入，串行很容易吃掉整个
+         * {@code warmup-ahead} 窗口，表现是"到点了还没预热完，用户拿到未预热"。
+         *
+         * <p>不能开太大：预热任务与其它 job 共用 DB 连接池
+         * （{@code application-job.yml} 里 job 角色的池是 10）。
+         * 4 是"明显够快"与"不抢连接"之间的折中，压测中可调。
+         */
+        private int    warmupConcurrency = 4;
+        /**
          * 消息重发任务的间隔（毫秒）。
          *
          * <p>用 {@code fixedDelay} 而不是 cron：重发的语义是"上一轮处理完之后再等

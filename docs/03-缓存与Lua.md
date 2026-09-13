@@ -548,16 +548,26 @@ public ActivityDetailVO getDetail(long activityId) {
         return w.getData();
     }
 
-    // 逻辑过期：先返回旧数据，后台单飞重建
-    if (lock.tryLock("lock:cache:activity:" + activityId, 0, 10, SECONDS)) {
-        cacheRebuildExecutor.submit(() -> {
-            try { rebuild(activityId, key); }
-            finally { lock.unlock("lock:cache:activity:" + activityId); }
-        });
-    }
+    // 逻辑过期：先返回旧数据，后台单飞重建。
+    // 锁在异步任务**内部**获取，不在 submit 之前拿 —— 理由见下方
+    cacheRebuildExecutor.submit(() -> {
+        if (!lock.tryLock("lock:cache:activity:" + activityId, 0, 30, SECONDS)) {
+            return;                     // 别人正在重建，这一次跳过
+        }
+        try { rebuild(activityId, key); }
+        finally { lock.unlock("lock:cache:activity:" + activityId); }
+    });
     return w.getData();      // 短暂返回旧值，可接受
 }
 ```
+
+**锁为什么必须在异步任务内部获取。** "先 `tryLock`，拿到再 `submit`"看着更
+自然，但线程池队列满时任务会被拒绝策略丢掉，那个 `finally` 里的 `unlock`
+**永远不会执行**——锁要等租期结束才释放，期间所有重建都被挡住、缓存一直是
+旧值。把 `tryLock` 放进任务里之后，"没拿到锁"和"任务没被调度"退化成同一个
+结果：本次不重建，下一个读到逻辑过期的请求会再触发一次。上面这段是伪代码，
+真实实现是通用组件 [`LogicalExpiryCache`](../fss-infra/src/main/java/com/fss/infra/cache/LogicalExpiryCache.java)，
+它同时处理了空值缓存、脏数据自愈与线程池拒绝策略。
 
 `CacheWrapper` 结构：
 
@@ -593,9 +603,22 @@ record CacheWrapper<T>(T data, long expireAt, boolean nullValue) {
 
 | 问题 | 手段 |
 | --- | --- |
-| 穿透（查不存在的数据） | 参数校验（ID 必须为正）→ 布隆过滤器（活动 ID 集合，预热时构建）→ 空值缓存 60s |
+| 穿透（查不存在的数据） | 参数校验（ID 必须为正）→ 空值缓存 60s |
 | 击穿（热点 key 过期） | 活动前主动预热 + 逻辑过期 + 单飞重建 |
-| 雪崩（大量 key 同时过期） | TTL 加 0~10 分钟随机抖动 + 分批预热 + Redis 主从哨兵 |
+| 雪崩（大量 key 同时过期） | TTL 加 0~10 分钟随机抖动 + 分批并发预热（`fss.job.warmup-concurrency`）+ Redis 哨兵（`application-sentinel.yml`，需显式激活） |
+
+穿透这条只做了两道，<b>没有布隆过滤器</b>：活动 ID 是小整数集合、攻击面小，
+而空值缓存已经把不存在的 ID 挡在了 DB 之外。布隆过滤器能省掉的那次 Redis
+往返，要与"预热期构建 + 误判率调参 + 多一份需要与 DB 同步的状态"相比——
+在当前量级下不划算。真要做的话 `RBloomFilter` 已经在依赖里（Redisson），
+但那是为"ID 空间大且会被枚举"的场景准备的。
+
+哨兵那一条要<b>显式激活</b>才生效：默认（`application.yml` + Testcontainers
+的单机 Redis）走的是单机连接，应用加 `sentinel` 这个 Spring profile 才切过去；
+而且<b>应用要在容器里</b>——哨兵对外只通告一个地址，它得同时被哨兵自己和客户端
+解析到，所以只能是容器名，宿主机上的进程解析不到。编排见 `docker-compose.yml`
+的 sentinel profile（1 主 2 从 3 哨兵）。
+注意别和 `fss.sentinel` 搞混，那个是阿里 Sentinel 流控。
 
 TTL 抖动实现：
 

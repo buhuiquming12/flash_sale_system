@@ -8,6 +8,7 @@
 #   phase4    prometheus + grafana
 #   phase5    nginx（多实例部署形态才有意义）
 #   all       上面全部 + 应用容器 + 前端容器（一键演示）
+#   sentinel  Redis 1 主 2 从 3 哨兵（叠加在 phase2 或 all 之上，见 redis 服务）
 #
 # 一键起整套（首次会构建应用与前端镜像，约 3~6 分钟）：
 #   docker compose --profile all up -d --build
@@ -26,6 +27,9 @@
 # 而 mysql-data 被删了、activityId 从 1 重新开始——两边一对上就是
 # "库存莫名少了几个"。清干净的写法：
 #   docker compose --profile all --profile phase5 down -v
+#
+# 起过哨兵的话 down 也要带上 --profile sentinel：那几个服务没有命名卷
+# （理由见下方），但容器本身会留下来。
 # =====================================================================
 name: fss
 
@@ -66,7 +70,7 @@ services:
   redis:
     image: redis:7.2-alpine
     container_name: fss-redis
-    profiles: ["phase2", "all"]
+    profiles: ["phase2", "all", "sentinel"]
     command:
       - redis-server
       - --appendonly
@@ -80,12 +84,192 @@ services:
       # 宁可写入失败（noeviction 下写满会报错，能被监控发现），也不能静默丢数据。
       - --maxmemory-policy
       - noeviction
+      # 下面两行是给<b>故障转移之后</b>准备的：这个容器一旦被降级成从库，
+      # 客户端拿到的就是它通报的地址。容器名 + 容器内端口，与其余节点一致。
+      # 它现在还是 master，这两行不生效——但少了它们，那个问题只在
+      # 经历两次故障切换之后才暴露，属于最难查的一类
+      - --replica-announce-ip
+      - redis
+      - --replica-announce-port
+      - "6379"
     volumes:
       - redis-data:/data
     ports:
       - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ==================================================================
+  # Redis 哨兵（profile: sentinel）
+  #
+  # 复用上面那个 redis 容器当 master，不另起一个 master 服务——那样会
+  # 有两个容器抢 6379，而 compose 只会在启动时报端口冲突。
+  #
+  # <b>通告地址一律用容器名，因此客户端也必须在同一个 compose 网络里。</b>
+  # 这不是图省事：Redis 哨兵对外只通告<b>一个</b>地址，而它要同时满足两方——
+  # 哨兵自己得连得上（它要监控 master 和从库、要投票选主），客户端也得连得上。
+  # 唯一的交集就是容器名。
+  #
+  # 实测过一次"通告改成 host.docker.internal"的写法，容器侧一切正常
+  # （复制、监控、选主都成立），但宿主机上 java -jar 跑的应用拿到的
+  # 是本机不可达的地址，启动直接失败：
+  #   ConnectTimeoutException: connection timed out: host.docker.internal/10.107.11.3:26381
+  #   SENTINEL SENTINELS command returns less than 2 nodes ...
+  # 所以<b>应用要跑在容器里</b>：--profile all --profile sentinel。
+  # 宿主机直接跑应用接哨兵这条路走不通，不是参数没调对——
+  # host.docker.internal 在容器内好用（经 host-gateway 出去），
+  # 在宿主机上却指向一个本机不可达的地址（Docker Desktop 写进 hosts 的那条）。
+  #
+  # 宿主端口 6380/6381/26379-26381 仍然发布，但只用于在宿主机上用 redis-cli
+  # 直连排查。它们与通告出去的端口（6379 / 26379）不是一回事，
+  # 别拿宿主机看到的端口去推断客户端会拿到什么。
+  #
+  # <b>演示时如果停了 master 却迟迟不选主，先看哨兵日志里有没有 +tilt。</b>
+  # 系统时钟跳变、或哨兵自身事件循环被拖慢 2 秒以上时，哨兵会进入 TILT 模式
+  # 并<b>暂停一切故障转移动作</b>。它是个保护机制（避免按一个错的时钟做决定），
+  # 但代价就是选主被无限期搁置。这不是配置问题——TILT 的阈值是哨兵内部常量，
+  # sentinel.conf 里配不了，能改的只有机器负载。
+  #
+  # Docker Desktop + WSL2 上尤其容易撞上：VM 时钟会漂，而机器同时跑着
+  # MySQL(1GB) / RocketMQ / 应用 JVM 时，哨兵的事件循环还容易超时。
+  # 实测两次：负载低时 +tilt 反复进出约 90 秒，之后 20 秒内完成选主；
+  # 负载高时 +tilt 每 8 秒重复进入、两分钟仍未退出，选主始终没发生。
+  # 演示前先把压测与集成测试停掉，或者接受"可能要等一两分钟"。
+  #
+  # 这期间应用侧的表现是对的，可以一并演示：Redis 真不可用时
+  # /actuator/health 转 DOWN（503），秒杀请求 fail-closed 而不是打向 MySQL；
+  # Redis 恢复后自动重连，实测三次探测内自愈，不需要重启应用。
+  #
+  # 这两个从库与三个哨兵<b>刻意不挂命名卷</b>，理由与 rocketmq-broker 相同：
+  # 演示形态的数据不值得为它授挂载权限，而且不新增命名卷意味着
+  # 文件头那条 down -v 的提示依然准确。
+  # ==================================================================
+
+  redis-replica-1:
+    image: redis:7.2-alpine
+    container_name: fss-redis-replica-1
+    profiles: ["sentinel"]
+    depends_on:
+      - redis
+    command:
+      - redis-server
+      # 从库的这几个参数必须与 master 逐项一致：库存与用户购买标记绝不能
+      # 被淘汰，否则故障转移之后接手的那个从库会静默丢 key
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - noeviction
+      - --replicaof
+      - redis
+      - "6379"
+      # 转正之后客户端拿到的就是这两个值。容器名 + 容器内端口，
+      # 与哨兵、其余节点的通告保持一致（见上面的说明）
+      - --replica-announce-ip
+      - redis-replica-1
+      - --replica-announce-port
+      - "6379"
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-replica-2:
+    image: redis:7.2-alpine
+    container_name: fss-redis-replica-2
+    profiles: ["sentinel"]
+    depends_on:
+      - redis
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - noeviction
+      - --replicaof
+      - redis
+      - "6379"
+      - --replica-announce-ip
+      - redis-replica-2
+      - --replica-announce-port
+      - "6379"
+    ports:
+      - "6381:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-sentinel-1:
+    image: redis:7.2-alpine
+    container_name: fss-redis-sentinel-1
+    profiles: ["sentinel"]
+    depends_on:
+      - redis
+      - redis-replica-1
+      - redis-replica-2
+    volumes:
+      - ./docker/redis/sentinel.conf.tpl:/etc/redis/sentinel.conf.tpl:ro
+    ports:
+      - "26379:26379"
+    # 模板 → 替换两个占位符 → 启动。这里 sed 进去的是字面量，不需要环境变量，
+    # 因此也没有 broker 那处"$$ 转义"的坑：那几个值不随部署形态变化，
+    # 而 broker 的 brokerIP1 会变，才必须绕一层环境变量
+    command: sh -c 'sed -e "s|__MASTER_HOST__|redis|g" -e "s|__ANNOUNCE_IP__|redis-sentinel-1|g" /etc/redis/sentinel.conf.tpl > /tmp/sentinel.conf && exec redis-server /tmp/sentinel.conf --sentinel'
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "sentinel", "get-master-addr-by-name", "mymaster"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-sentinel-2:
+    image: redis:7.2-alpine
+    container_name: fss-redis-sentinel-2
+    profiles: ["sentinel"]
+    depends_on:
+      - redis
+      - redis-replica-1
+      - redis-replica-2
+    volumes:
+      - ./docker/redis/sentinel.conf.tpl:/etc/redis/sentinel.conf.tpl:ro
+    ports:
+      - "26380:26379"
+    command: sh -c 'sed -e "s|__MASTER_HOST__|redis|g" -e "s|__ANNOUNCE_IP__|redis-sentinel-2|g" /etc/redis/sentinel.conf.tpl > /tmp/sentinel.conf && exec redis-server /tmp/sentinel.conf --sentinel'
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "sentinel", "get-master-addr-by-name", "mymaster"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-sentinel-3:
+    image: redis:7.2-alpine
+    container_name: fss-redis-sentinel-3
+    profiles: ["sentinel"]
+    depends_on:
+      - redis
+      - redis-replica-1
+      - redis-replica-2
+    volumes:
+      - ./docker/redis/sentinel.conf.tpl:/etc/redis/sentinel.conf.tpl:ro
+    ports:
+      - "26381:26379"
+    command: sh -c 'sed -e "s|__MASTER_HOST__|redis|g" -e "s|__ANNOUNCE_IP__|redis-sentinel-3|g" /etc/redis/sentinel.conf.tpl > /tmp/sentinel.conf && exec redis-server /tmp/sentinel.conf --sentinel'
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "sentinel", "get-master-addr-by-name", "mymaster"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -237,7 +421,14 @@ services:
     environment:
       # consumer 必须激活：阶段三起订单由消费端创建，不激活所有秒杀都停在"排队中"。
       # job 决定对账、降级监控、关单扫描跑不跑。dev 建演示数据并开放 mock-sign
-      SPRING_PROFILES_ACTIVE: web,consumer,job,dev
+      # 默认与加哨兵之前完全一致。要让容器里的应用也走哨兵：
+      #   FSS_SPRING_PROFILES=web,consumer,job,dev,sentinel \
+      #       docker compose --profile all --profile sentinel up -d
+      # 不能把 sentinel 写死在这里——默认那套是 redis 单机，
+      # 写死之后默认演示反而会去找哨兵然后连不上。
+      # 哨兵节点不用在这里注入：application-sentinel.yml 的默认值就是
+      # 容器名形式，与本节其余通告地址一致
+      SPRING_PROFILES_ACTIVE: "${FSS_SPRING_PROFILES:-web,consumer,job,dev}"
       # 必须显式指定：application-job.yml 里设了 8099、consumer 设了 8090，
       # profile 顺序靠后的会覆盖前面的。环境变量优先级高于两者
       SERVER_PORT: 8080

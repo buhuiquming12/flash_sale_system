@@ -35,6 +35,16 @@
         <redisson.version>3.36.0</redisson.version>
         <sentinel.version>1.8.8</sentinel.version>
         <rocketmq-spring.version>2.3.1</rocketmq-spring.version>
+
+        <!--
+            surefire 与 failsafe 必须同版本：两者共用同一个 JUnit Platform provider，
+            版本错开时会出现"单测正常、集成测试找不到引擎"这类只在一侧复现的问题。
+            本项目没有用 spring-boot-starter-parent（只 import 了 BOM），插件版本
+            不受任何管理，不显式声明就取 Maven 超级 POM 的默认值——换一台 Maven
+            版本不同的机器，跑的就是另一个 surefire。
+        -->
+        <maven-surefire.version>3.5.2</maven-surefire.version>
+        <jacoco.version>0.8.12</jacoco.version>
     </properties>
 
     <dependencyManagement>
@@ -188,6 +198,10 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
+                <!-- 钉住当前实际解析到的版本。不写时取 Maven 超级 POM 的默认值，
+                     换一台 Maven 版本不同的机器编译器就换了，而 Maven 自己会为此
+                     报一条 "threaten the stability of your build" 的警告 -->
+                <version>3.13.0</version>
                 <configuration>
                     <release>${maven.compiler.release}</release>
                     <parameters>true</parameters>
@@ -200,12 +214,157 @@
                     </annotationProcessorPaths>
                 </configuration>
             </plugin>
+            <!--
+                ============================ 测试分层 ============================
+                测试分两类，跑法完全不同：
+
+                  · 快测（5 个类）纯 JUnit，不起 Spring、不碰 Docker，毫秒级
+                  · 集成测试（18 个类）继承 IntegrationTestBase，要起 MySQL +
+                    Redis + RocketMQ 三套 Testcontainers，约 6 分钟
+
+                分开的理由不是洁癖：合在一起时唯一能跑的命令是"全跑"，而全跑需要
+                Docker，于是日常构建只能写 -DskipTests——等于没有快速反馈回路。
+
+                筛选靠 IntegrationTestBase 上的 @Tag("integration")。@Tag 是
+                @Inherited 的，18 个子类自动继承，不需要逐个标注；新增的集成测试
+                只要继承基类就自动落到正确的一边，不会因为忘了打标签而漏跑。
+
+                  mvn test              → 只跑快测，不需要 Docker
+                  mvn verify -DskipITs  → 快测 + 打包，不需要 Docker
+                  mvn verify            → 全部，需要 Docker
+                =================================================================
+            -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
+                <version>${maven-surefire.version}</version>
                 <configuration>
-                    <argLine>-Dfile.encoding=UTF-8</argLine>
+                    <!--
+                        @{argLine} 是 JaCoCo prepare-agent 注入 agent 参数的位置，
+                        必须用 @{} 的延迟求值而不是 ${}：${} 在插件配置解析时就取值，
+                        那时 prepare-agent 还没执行，拿到的是空。
+
+                        -Dfile.encoding=UTF-8 不能去掉：EvalShaScriptExecutorTest
+                        的 FakeRedis 依赖"测试 JVM 是 UTF-8、被模拟的运行时是 GBK"
+                        这个差异来复现 EVALSHA 回落缺陷，去掉之后那个用例退化成
+                        恒等变换，永远绿灯。
+                    -->
+                    <argLine>@{argLine} -Dfile.encoding=UTF-8</argLine>
+                    <excludedGroups>integration</excludedGroups>
                 </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <version>${maven-surefire.version}</version>
+                <configuration>
+                    <argLine>@{failsafeArgLine} -Dfile.encoding=UTF-8</argLine>
+                    <groups>integration</groups>
+                    <!--
+                        仓库里没有 *IT 命名的类，failsafe 默认的 includes
+                        （**/IT*.java、**/*IT.java、**/*ITCase.java）一个也匹配不上，
+                        表现是"集成测试一个没跑，构建还是绿的"。改成与 surefire 同样的
+                        命名规则，真正的筛选交给上面的 groups。
+                    -->
+                    <includes>
+                        <include>**/*Test.java</include>
+                    </includes>
+                    <!--
+                        必须显式指定。spring-boot-maven-plugin 的 repackage 在
+                        package 阶段把主 artifact 换成了 fat jar，而 failsafe 默认
+                        拿主 artifact 当测试 classpath——fat jar 里的类在
+                        BOOT-INF/classes 下，普通 classloader 找不到，
+                        症状是 ClassNotFoundException 而不是"配置错了"。
+                    -->
+                    <classesDirectory>${project.build.outputDirectory}</classesDirectory>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <!-- verify 这个 goal 负责把失败结果抛出来；只配
+                                 integration-test 的话测试跑了但失败不会让构建红 -->
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!--
+                覆盖率。只出报告、不设阈值门禁——先拿到基线数字，而不是让一个
+                拍脑袋的阈值把 CI 搞红。
+
+                单测与集成测试分别记到两个 exec 文件再合并：集成测试覆盖的是
+                Lua、消费端、对账这些主路径，单测覆盖的是状态机与导出格式，
+                两边差别很大，只统计其中一边得出的结论会误导。
+            -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>${jacoco.version}</version>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                        <configuration>
+                            <propertyName>argLine</propertyName>
+                            <destFile>${project.build.directory}/jacoco.exec</destFile>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>prepare-agent-integration</id>
+                        <goals>
+                            <goal>prepare-agent-integration</goal>
+                        </goals>
+                        <configuration>
+                            <!--
+                                propertyName 必须显式给。prepare-agent-integration
+                                的默认值<b>也是 argLine</b>（不是想当然的 failsafeArgLine），
+                                不指定的话两件事同时发生：它在 pre-integration-test
+                                阶段把 argLine 覆盖成指向 jacoco-it.exec，而 failsafe
+                                配置里的 @{failsafeArgLine} 因为属性不存在<b>原样</b>
+                                传给了 java 命令行。症状是
+                                "The forked VM terminated without properly saying goodbye"，
+                                看起来像 JVM 崩溃，实际是命令行里多了个字面量 @{...}。
+                            -->
+                            <propertyName>failsafeArgLine</propertyName>
+                            <destFile>${project.build.directory}/jacoco-it.exec</destFile>
+                        </configuration>
+                    </execution>
+                    <!-- merge 必须声明在 report 之前：同一阶段内的执行顺序按声明顺序 -->
+                    <execution>
+                        <id>merge-exec</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>merge</goal>
+                        </goals>
+                        <configuration>
+                            <fileSets>
+                                <fileSet>
+                                    <directory>${project.build.directory}</directory>
+                                    <includes>
+                                        <include>jacoco.exec</include>
+                                        <include>jacoco-it.exec</include>
+                                    </includes>
+                                </fileSet>
+                            </fileSets>
+                            <destFile>${project.build.directory}/jacoco-merged.exec</destFile>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                        <configuration>
+                            <dataFile>${project.build.directory}/jacoco-merged.exec</dataFile>
+                            <outputDirectory>${project.build.directory}/site/jacoco</outputDirectory>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

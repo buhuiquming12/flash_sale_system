@@ -1,0 +1,41 @@
+# =====================================================================
+# Redis 哨兵形态（opt-in，默认不生效）。
+#
+# 激活方式：在既有的角色 profile 后面追加 sentinel
+#   FSS_SPRING_PROFILES=web,consumer,job,dev,sentinel \
+#       docker compose --profile all --profile sentinel up -d
+# 哨兵集群本身由 docker-compose.yml 的 sentinel profile 提供
+# （1 主 2 从 3 哨兵，quorum=2，能真正自动选主）。
+#
+# <b>应用必须在容器里。</b>哨兵对外只通告一个地址，而这个地址要同时被
+# 哨兵自己和客户端解析到，所以它只能是容器名——宿主机上的进程解析不到。
+# 实测过在宿主机上 java -jar 跑：能连上 127.0.0.1:26379 的哨兵，但哨兵回给
+# 它的节点名解析失败，启动直接报
+#   ConnectTimeoutException ... / SENTINEL SENTINELS command returns less than 2 nodes
+# 宿主机上的 127.0.0.1:26379-26381 只适合用 redis-cli 直连排查。
+#
+# <b>为什么不能写进 application.yml</b>：Spring Boot 只要看到
+# spring.data.redis.sentinel.nodes 非空，就会改用哨兵配置建 Lettuce 连接工厂，
+# 而集成测试用 Testcontainers 起的是<b>单机</b> redis 容器、靠
+# @DynamicPropertySource 注入 spring.data.redis.host/port
+# （见 IntegrationTestBase）。哨兵段一旦落进基础配置，测试与本地开发会一起被
+# 拽进哨兵模式然后连不上。放在独立 profile 里，不激活时
+# spring.data.redis.sentinel 这个键<b>完全不存在</b>，与今天的单机行为一致。
+#
+# <b>为什么给具体默认值而不是留空</b>：nodes 为空时 Boot 会静默退回单机模式，
+# 症状是"激活了哨兵 profile，实际连的却是 host:port"——一个不报错的错配置。
+# 宁可连不上，也不要静默走错模式。
+#
+# 注意别和 fss.sentinel 搞混：那个是阿里 Sentinel 流控（见 SentinelConfig），
+# 与 Redis 哨兵没有任何关系，前缀也不同。
+# =====================================================================
+spring:
+  data:
+    redis:
+      sentinel:
+        # 必须与 docker/redis/sentinel.conf.tpl 里 monitor 的 master 名一致，
+        # 否则哨兵会说"没有这个 master"，而报错发生在建连时、指向 Redisson
+        master: ${FSS_REDIS_MASTER:mymaster}
+        # 容器名 + 容器内端口。三个哨兵容器内都监听 26379，
+        # 宿主侧的 26379/26380/26381 只是发布端口，与这里无关
+        nodes: ${FSS_REDIS_SENTINEL_NODES:redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379}

@@ -209,6 +209,10 @@ fss:
     close-expired-cron: "0 */2 * * * ?"
     activity-state-cron: "0 * * * * ?"
     warmup-cron: "0 * * * * ?"
+    # 预热并发度。活动之间无依赖，串行会让"到点还没预热完"的风险随活动数
+    # 线性放大；但预热与其它 job 共用 job 角色的 DB 连接池（10），
+    # 开太大反而抢连接。4 是折中，见 FssProperties.Job 的注释
+    warmup-concurrency: 4
     mq-resend-delay-ms: 30000
     # 三类对账的频率不同是刻意的：资格对账最频繁（用户正在等），
     # 库存对账最贵（SCAN + 多次 DB），支付对账最不急但最严重。见 ReconcileJob 注释

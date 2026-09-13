@@ -1,5 +1,7 @@
 # 电商秒杀系统
 
+[![CI](https://github.com/buhuiquming12/flash_sale_system/actions/workflows/ci.yml/badge.svg)](https://github.com/buhuiquming12/flash_sale_system/actions/workflows/ci.yml)
+
 高并发秒杀系统的完整工程实现，覆盖流量削峰、库存防超卖、一人一单、消息幂等、
 订单状态机、最终一致性、限流降级、监控压测与故障补偿。
 
@@ -92,6 +94,37 @@ docker compose --profile all logs -f app # 跟应用日志（演示数据就绪�
 docker compose --profile all stop        # 停但留数据
 ```
 
+### 可选：把 Redis 换成 1 主 2 从 3 哨兵
+
+默认是单点 Redis。要验证"主库挂了秒杀入口不会整体不可用"：
+
+```bash
+# 3 个哨兵才有 quorum=2，才谈得上自动选主
+FSS_SPRING_PROFILES=web,consumer,job,dev,sentinel \
+    docker compose --profile all --profile sentinel up -d
+
+# 当前 master 是哪个
+docker exec fss-redis-sentinel-1 redis-cli -p 26379 \
+    sentinel get-master-addr-by-name mymaster
+
+# 停掉 master，哨兵应在 5 秒判死后自动选主
+docker stop fss-redis
+docker exec fss-redis-sentinel-1 redis-cli -p 26379 \
+    sentinel get-master-addr-by-name mymaster      # 这次返回的是某个从库
+```
+
+哨兵把"Redis 全挂"降级成"可能丢几秒未复制的写入"（异步复制 +
+`appendfsync everysec`），<b>不是零丢失</b>。配置在
+`fss-app/src/main/resources/application-sentinel.yml`。
+
+<b>应用必须在容器里</b>——也就是上面那条命令，不能是宿主机上的 `java -jar`。
+哨兵对外只通告<b>一个</b>地址，它得同时被哨兵自己和客户端解析到，所以只能是
+容器名，而宿主机上的进程解析不到容器名。实测过直连 `127.0.0.1:26379`：
+能连上哨兵，但哨兵回给它的节点名解析失败，应用启动直接失败并报
+`SENTINEL SENTINELS command returns less than 2 nodes`。宿主机上的
+26379-26381 只适合用 `redis-cli` 直连排查。细节见 `docker-compose.yml`
+里 sentinel 那段的注释。
+
 **如果所有秒杀都停在"排队中"**，先看建 Topic 那一步：
 
 ```bash
@@ -158,6 +191,14 @@ cd fss-web && npm install && npm run dev   # http://localhost:5173
 docker compose --profile all --profile phase5 down -v
 ```
 
+起过哨兵的话，`down` 还要带上 `--profile sentinel`：那几个服务（两个从库与
+三个哨兵）<b>没有命名卷</b>——理由与 broker 相同，不值得为演示数据授挂载
+权限——但容器本身会留下来：
+
+```bash
+docker compose --profile all --profile sentinel --profile phase5 down -v
+```
+
 Redis 地址默认 `127.0.0.1:6379`，可用 `FSS_REDIS_HOST` / `FSS_REDIS_PORT` 覆盖；
 RocketMQ 默认 `127.0.0.1:9876`，可用 `FSS_MQ_NAMESRV` 覆盖。
 **Redis 必须可用**：库存判定是 fail-closed 的，连不上时秒杀接口一律返回
@@ -165,7 +206,24 @@ RocketMQ 默认 `127.0.0.1:9876`，可用 `FSS_MQ_NAMESRV` 覆盖。
 
 ## 运行测试
 
-集成测试用 Testcontainers 起真实 MySQL、真实 Redis、真实 RocketMQ
+测试分两层，跑法不同：
+
+| 命令 | 跑什么 | 需要 Docker | 耗时 |
+| --- | --- | --- | --- |
+| `mvn test` | 5 个快测 | **否** | 秒级 |
+| `mvn verify -DskipITs` | 5 个快测 + 打包 | **否** | 秒级 |
+| `mvn verify` | 全部 23 个类 / 147 个用例 | 是 | 约 5 分 50 秒 |
+
+分层靠 `IntegrationTestBase` 上的 `@Tag("integration")`：surefire 用 `excludedGroups`
+把它排除，failsafe 用 `groups` 把它挑出来。`@Tag` 是 `@Inherited` 的，新增的集成测试
+只要继承基类就自动落到正确的一边，不需要记得打标签。
+
+**快测那 5 个类**（`OrderStateMachineTest`、`MqTopicConsistencyTest`、`LuaScriptShaTest`、
+`EvalShaScriptExecutorTest`、`MetricsExportTest`）是纯 JUnit，不起 Spring 也不碰 Docker。
+它们防的恰好是最容易被静默改坏的那类东西——状态机迁移表、Topic 名、指标导出名、
+脚本 SHA——跑得快才会被真的跑。
+
+**集成测试**用 Testcontainers 起真实 MySQL、真实 Redis、真实 RocketMQ
 （不是 H2、不是嵌入式 Redis、不是 Mock 的 `RocketMQTemplate`），需要 Docker 在运行：
 
 ```bash
@@ -178,7 +236,24 @@ mvn clean verify
 测试用的 MQ 端口刻意错开 compose 的那套（namesrv 9877、broker 10921），
 所以 `mvn verify` 和联调环境可以同时活着。
 
+覆盖率报告有两份：`fss-app/target/site/jacoco-aggregate/index.html` 是跨模块汇总，
+各模块的 `target/site/jacoco/index.html` 是单模块视图。汇总那份才是基线数字——
+`fss-infra` 里的 Lua 执行器、令牌桶、分布式锁自己没有测试源码，是被 `fss-app` 的
+集成测试跑到的，只看单模块报告它们根本不出现。
+只出报告不设阈值门禁——先拿基线数字，而不是让一个拍脑袋的阈值把构建搞红。
+
 当前 **21 个测试类 / 147 个用例**，全绿约 5 分 50 秒（连跑两轮验证过稳定性）。
+
+### CI
+
+`.github/workflows/ci.yml` 三个 job 并行：`fast`（编译 + 快测 + 打包）、
+`frontend`（`npm ci` + `vue-tsc` + `vite build`）、`integration`（全量，含三套容器）。
+push 到 `main`、任何 PR、以及手动触发时都会跑。
+
+workflow 里 `TZ: Asia/Shanghai` 不是可选项：runner 默认 UTC，而
+`IntegrationTestBase` 给 MySQL 强制了 `--default-time-zone=+08:00`，不设时
+`DatabaseTimezoneTest` 会算出 28800 秒偏差直接全红——而那个类本来就是为了抓
+这个 8 小时错位才写的。
 
 | 测试类 | 覆盖 |
 | --- | --- |
@@ -556,8 +631,11 @@ Redis 与 Lettuce / Redisson 的分工是刻意的：Lua 与普通读写走 Lett
 
 ### 阶段四已知限制
 
-- **Redis 单点**（演示环境）。生产需哨兵或 Cluster；Key 已带 hash tag，上 Cluster
-  无需改代码。
+- **Redis 默认单点**（演示环境）。需要时 `--profile sentinel` 可起 1 主 2 从
+  3 哨兵，应用加 `sentinel` profile 即接入（配置见 `application-sentinel.yml`）。
+  注意应用<b>必须在容器里</b>：哨兵通告的是容器名，宿主机上的进程解析不到。
+  故障切换会丢未复制的写入，不是零丢失。生产也可上 Cluster；Key 已带 hash tag，
+  上 Cluster 无需改代码。
 - **单 broker、消息数据不持久化到卷**。要持久化就得 `user: root`，
   为演示环境授这个权不值得。`stop`/`start` 数据保留，`down` 之后 Topic 需重建。
 - **Nginx 只提供配置未接入本地运行**。它要 `proxy_pass` 到两个 web 容器，

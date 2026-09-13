@@ -189,6 +189,37 @@ class ScheduledJobTest extends IntegrationTestBase {
                 .isEqualTo(9L);
     }
 
+    @Test
+    @DisplayName("同一批里一个活动预热失败，同批其他活动照常完成")
+    void 预热失败不影响同批其他活动() {
+        long goodId = createReadyActivity(WarmupState.NONE);
+        long badId  = createReadyActivity(WarmupState.NONE);
+
+        // 把坏活动做成"无商品"：WarmupService.doWarmup 会在此抛 ACTIVITY_NOT_READY。
+        // 选它是因为它是预热自身的确定性失败，而这里要验的正是
+        // "一个活动抛异常，同一批里的其他活动照常完成"
+        jdbc.update("DELETE FROM t_seckill_goods WHERE activity_id = ?", badId);
+
+        // 不抛异常本身就是断言的一部分：改成并发之后最大的风险是一条异常
+        // 让整批炸掉，或者被线程池/Future 吃掉而没人知道
+        warmupJob.warmup();
+
+        assertThat(warmupStateOf(goodId))
+                .as("坏活动不能拖垮同批的好活动——这是失败隔离的全部意义。"
+                        + "串行改并发时最容易丢的就是这条")
+                .isEqualTo(WarmupState.DONE.code());
+        assertThat(warmupStateOf(badId))
+                .as("坏活动必须留下 FAILED 痕迹。只记异常不置位的话，它下一轮会被"
+                        + "当成未预热重新捞起来，运维看到的是一遍遍刷同一个错误")
+                .isEqualTo(WarmupState.FAILED.code());
+
+        // 坏活动仍满足 selectNeedWarmup 的条件（warmup_state IN (0,3)），
+        // 会被同类后续用例的 warmup() 重新捞起来刷一条告警日志。
+        // 把它的时间窗口挪到过去，不再干扰别的用例
+        jdbc.update("UPDATE t_seckill_activity SET start_time = ?, end_time = ? WHERE id = ?",
+                LocalDateTime.now().minusHours(2), LocalDateTime.now().minusHours(1), badId);
+    }
+
     private int warmupStateOf(long activityId) {
         return jdbc.queryForObject(
                 "SELECT warmup_state FROM t_seckill_activity WHERE id = ?",
