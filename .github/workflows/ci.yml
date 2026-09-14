@@ -119,10 +119,17 @@ jobs:
     # 每个 submitAndAwait / awaitOrders 都烧满 TestFixture.AWAIT 的 60 秒上限——
     # 9 个测试类 36 个用例连环失败，**纯等待 35.9 分钟**，真正跑测试只有 16 秒。
     #
+    # 为什么只有 broker 的端口没监听、namesrv 的却好好的：镜像
+    # apache/rocketmq:5.3.0 只 EXPOSE 了 9876/10909/10911/10912，而 dockerd
+    # **只发布容器 EXPOSE 过的端口**，没 EXPOSE 的 PortBindings 会被静默丢弃。
+    # namesrv 用的容器端口 9876 在列表里，broker 用的 10921 不在——绑定被丢，
+    # 宿主端口自然没人监听。Docker Desktop（本地）不校验这一条，所以这个坑
+    # 只在 CI 上暴露。修法见 IntegrationTestBase.fixedPort。
+    #
     # 这类故障的定位手段已补在 IntegrationTestBase.assertMqReachable：容器起来后
     # 立刻探一次端口，连不上就秒级失败并指出是"崩了"还是"端口没发布"，
-    # 不会再出现"红一次 40 分钟、却看不出为什么"。60 分钟只是余量——
-    # 一次健康的 run 应该在 5 分钟上下。
+    # 不会再出现"红一次 40 分钟、却看不出为什么"，也不会再让 18 个类各烧 60 秒。
+    # 60 分钟只是余量——一次健康的 run 应该在 5 分钟上下。
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4

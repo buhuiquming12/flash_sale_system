@@ -1,6 +1,10 @@
 package com.fss.test;
 
 import com.fss.app.FssApplication;
+import com.github.dockerjava.api.command.CreateContainerCmd;
+import com.github.dockerjava.api.model.ExposedPort;
+import com.github.dockerjava.api.model.PortBinding;
+import com.github.dockerjava.api.model.Ports;
 import org.junit.jupiter.api.Tag;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
@@ -16,6 +20,7 @@ import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
 
 import java.time.Duration;
+import java.util.function.Consumer;
 
 /**
  * 集成测试基类。
@@ -99,9 +104,8 @@ public abstract class IntegrationTestBase {
                     .withCommand("sh", "mqnamesrv")
                     // 默认 -Xms4g，普通开发机直接 OOM 起不来
                     .withEnv("JAVA_OPT_EXT", "-Xms128m -Xmx256m -Xmn128m")
-                    .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
-                            .withPortBindings(fixedBinding(
-                                    MQ_NAMESRV_PORT, MQ_NAMESRV_CONTAINER_PORT)))
+                    .withCreateContainerCmdModifier(
+                            fixedPort(MQ_NAMESRV_PORT, MQ_NAMESRV_CONTAINER_PORT))
                     .waitingFor(Wait.forLogMessage(".*Name Server boot success.*\\n", 1)
                             .withStartupTimeout(Duration.ofMinutes(3)));
 
@@ -113,11 +117,10 @@ public abstract class IntegrationTestBase {
                             "/home/rocketmq/broker-test.conf")
                     .withCommand("sh", "mqbroker", "-c", "/home/rocketmq/broker-test.conf")
                     .withEnv("JAVA_OPT_EXT", "-Xms256m -Xmx512m -Xmn128m")
-                    .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
+                    .withCreateContainerCmdModifier(
                             // broker 的 listenPort 由 broker-test.conf 指定为 10921，
                             // 容器内外同号，所以这里两个参数一样
-                            .withPortBindings(fixedBinding(
-                                    MQ_BROKER_PORT, MQ_BROKER_PORT)))
+                            fixedPort(MQ_BROKER_PORT, MQ_BROKER_PORT))
                     .waitingFor(Wait.forLogMessage(".*boot success.*\\n", 1)
                             .withStartupTimeout(Duration.ofMinutes(3)));
 
@@ -141,10 +144,9 @@ public abstract class IntegrationTestBase {
      * {@code submitAndAwait} / {@code awaitOrders} 都烧满整整 60 秒才失败。
      *
      * <p>CI 上真发生过一次：broker 的 127.0.0.1:10921 全程无监听（2344 次
-     * {@code RemotingConnectException}），而 namesrv 的 9877 一次都没失败——
-     * 两个容器用的是同一套端口绑定写法。后果是 9 个测试类、37 个用例连环失败，
-     * <b>纯等待就烧掉 36 分钟</b>，把 job 的 40 分钟超时吃满，而日志里没有一行
-     * 直接说"broker 连不上"。
+     * {@code RemotingConnectException}），而 namesrv 的 9877 一次都没失败。
+     * 后果是 9 个测试类、37 个用例连环失败，<b>纯等待就烧掉 36 分钟</b>，
+     * 把 job 的 40 分钟超时吃满，而日志里没有一行直接说"broker 连不上"。
      *
      * <p>所以这里在容器刚起来时就主动连一次：连不上立刻抛，几秒内失败，
      * 而不是让 18 个测试类各自慢慢烧完 60 秒。
@@ -155,8 +157,8 @@ public abstract class IntegrationTestBase {
     private static void assertMqReachable() {
         assertRunning(MQ_NAMESRV, "namesrv");
         assertRunning(MQ_BROKER, "broker");
-        assertTcp(MQ_NAMESRV_PORT, "namesrv");
-        assertTcp(MQ_BROKER_PORT, "broker");
+        assertTcp(MQ_NAMESRV, MQ_NAMESRV_PORT, MQ_NAMESRV_CONTAINER_PORT, "namesrv");
+        assertTcp(MQ_BROKER, MQ_BROKER_PORT, MQ_BROKER_PORT, "broker");
     }
 
     /** 容器还活着吗。分开判才能区分"崩了"和"端口没发布" */
@@ -169,15 +171,38 @@ public abstract class IntegrationTestBase {
         }
     }
 
-    private static void assertTcp(int port, String what) {
+    private static void assertTcp(GenericContainer<?> c, int hostPort, int containerPort,
+                                  String what) {
         try (java.net.Socket s = new java.net.Socket()) {
-            s.connect(new java.net.InetSocketAddress("127.0.0.1", port), 5000);
+            s.connect(new java.net.InetSocketAddress("127.0.0.1", hostPort), 5000);
         } catch (Exception e) {
             throw new IllegalStateException(
-                    what + " 的宿主端口 127.0.0.1:" + port + " 连不上，集成测试必然"
+                    what + " 的宿主端口 127.0.0.1:" + hostPort + " 连不上，集成测试必然"
                             + "全军覆没（每个异步等待都会烧满 60 秒）。容器还在运行却连不上，"
-                            + "说明端口没发布——检查 " + what + " 的 withPortBindings 是否生效"
-                            + "（docker port " + what + " 容器 id），以及端口是否被别的东西占了", e);
+                            + "说明端口没发布——检查 " + what + " 的 fixedPort 是否生效"
+                            + "（docker port " + what + " 容器 id），以及端口是否被别的东西占了。"
+                            + "Docker 侧的实际情况：" + publishState(c, containerPort), e);
+        }
+    }
+
+    /**
+     * 失败路径上的诊断：Docker 到底把容器端口 <b>发布</b> 到宿主哪个端口了。
+     *
+     * <p>{@code getMappedPort} 读的是 {@code docker inspect} 的 NetworkSettings，
+     * 也就是 daemon 的最终结论，不是我们的请求——所以它能回答
+     * "PortBindings 是不是被 dockerd 丢掉了"这个从 Java 侧看不见的问题。
+     *
+     * <p>只做诊断：它自己出任何错都不能把原始异常盖掉，所以全部吞掉。
+     */
+    private static String publishState(GenericContainer<?> c, int containerPort) {
+        try {
+            return "容器端口 " + containerPort + "/tcp 被 daemon 发布在宿主 "
+                    + c.getMappedPort(containerPort) + "（若不是我们要的端口，"
+                    + "或这里抛异常说没有映射，就是 PortBindings 被丢弃了）";
+        } catch (Exception e) {
+            return "daemon 没有为容器端口 " + containerPort + "/tcp 建立任何映射（"
+                    + e.getMessage() + "）。最常见的原因是该端口不在镜像的 EXPOSE 里——"
+                    + "见 fixedPort 的注释";
         }
     }
 
@@ -186,15 +211,31 @@ public abstract class IntegrationTestBase {
      *
      * <p>两个端口号刻意分开传：namesrv 在容器里永远监听 9876（写死在
      * {@code mqnamesrv} 里），而宿主侧要用 9877 才不跟 docker-compose 的那套撞。
-     * 早先写成 9877→9877 时容器里根本没有进程监听 9877，
-     * 症状是客户端报 "send request to /127.0.0.1:9877 failed"，
-     * 看起来像网络不通，其实是端口映射到了一个空端口。
+     *
+     * <h4>为什么必须连 EXPOSE 一起设</h4>
+     * <b>只设 {@code PortBindings} 在原生 Linux dockerd 上不生效</b>：
+     * Docker 只发布容器 EXPOSE 过的端口，没 EXPOSE 的绑定会被<b>静默丢弃</b>——
+     * 容器照常启动、broker 照常打 "boot success"，只有宿主端口没人监听。
+     *
+     * <p>这正是 CI 上"namesrv 的 9877 好、broker 的 10921 连不上"的原因：
+     * 镜像 apache/rocketmq:5.3.0 只 EXPOSE 了 9876/10909/10911/10912。
+     * namesrv 用的容器端口 9876 在列表里，所以绑定生效；broker 用的 10921 不在，
+     * 所以绑定被丢掉。Docker Desktop 的端口转发不校验 EXPOSE，于是这个问题
+     * <b>只在 CI 上暴露</b>——本地跑 mvn verify 一路绿，极具迷惑性。
+     * （早先那次 9877→9877 的故障八成也是同一个原因：9877 不在 EXPOSE 里，
+     * 换成 9876 就好了，当时归因成了"映射到了一个空端口"。）
+     *
+     * <p>放在 {@code withCreateContainerCmdModifier} 里而不是
+     * {@code withExposedPorts}：后者会把端口交给 Testcontainers 随机分配宿主端口，
+     * 而 broker 必须用固定端口（见类注释）。
      */
-    private static com.github.dockerjava.api.model.PortBinding fixedBinding(
-            int hostPort, int containerPort) {
-        return new com.github.dockerjava.api.model.PortBinding(
-                com.github.dockerjava.api.model.Ports.Binding.bindPort(hostPort),
-                new com.github.dockerjava.api.model.ExposedPort(containerPort));
+    private static Consumer<CreateContainerCmd> fixedPort(int hostPort, int containerPort) {
+        return cmd -> {
+            ExposedPort exposed = new ExposedPort(containerPort);
+            cmd.withExposedPorts(exposed);
+            cmd.getHostConfig().withPortBindings(
+                    new PortBinding(Ports.Binding.bindPort(hostPort), exposed));
+        };
     }
 
     /**
