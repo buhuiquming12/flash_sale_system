@@ -4,7 +4,11 @@
 # 三个 job 并行，各自独立不传 artifact：
 #   fast        编译 + 5 个快测 + 打包，不碰 Docker，~2 分钟
 #   frontend    npm ci + vue-tsc + vite build，~1.5 分钟
-#   integration mvn verify 全量，起 MySQL + Redis + RocketMQ 三套容器，~10~15 分钟
+#   integration mvn verify 全量，起 MySQL + Redis + RocketMQ 三套容器
+#
+# integration 首次 run 跑满 40 分钟被超时掐掉，但原因**不是** runner 慢——
+# 日志证明恰恰相反：通过的类在 runner 上比本机还快（ActivityCacheTest
+# 3.4s vs 本机 77.4s）。那 40 分钟是被烧掉的，详见 job 上 timeout 那段注释。
 #
 # integration 会把 fast 那 5 个快测再跑一遍（毫秒级）。多这一次的代价远小于
 # 在两个 job 之间传 target/ 的复杂度，而且两个 job 谁先挂都能单独定位。
@@ -107,7 +111,19 @@ jobs:
   integration:
     name: 集成测试
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # 60 而不是 40。但这不是"runner 慢"——首次 run 的日志证明恰恰相反：
+    # 通过的类在 runner 上比本机还快（ActivityCacheTest 3.4s vs 本机 77.4s，
+    # RateLimitWebTest 6.5s vs 44.9s）。那 40 分钟是被烧掉的：
+    # broker 的 127.0.0.1:10921 全程无监听（2344 次 RemotingConnectException），
+    # 每次 ReliableMqProducer.sendReliable 都失败，请求停在 PENDING，于是
+    # 每个 submitAndAwait / awaitOrders 都烧满 TestFixture.AWAIT 的 60 秒上限——
+    # 9 个测试类 36 个用例连环失败，**纯等待 35.9 分钟**，真正跑测试只有 16 秒。
+    #
+    # 这类故障的定位手段已补在 IntegrationTestBase.assertMqReachable：容器起来后
+    # 立刻探一次端口，连不上就秒级失败并指出是"崩了"还是"端口没发布"，
+    # 不会再出现"红一次 40 分钟、却看不出为什么"。60 分钟只是余量——
+    # 一次健康的 run 应该在 5 分钟上下。
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -129,6 +145,58 @@ jobs:
 
       - name: 全量测试
         run: mvn -B --no-transfer-progress verify
+
+      # ================================================================
+      # 无论成败都打印「时间花在哪 + 为什么失败」。
+      #
+      # Maven 其实每个类都会打一行 "Time elapsed: 77.44 s -- in com.fss.xxx"，
+      # 但它们散在几十万行输出里（SeckillLuaTest 一个类的日志就 3.5MB），
+      # 想知道哪个类慢得自己往下翻。这一步把 XML 报告汇总成一张降序排行表，
+      # 再把失败/错误用例的消息连类名一起打出来。
+      #
+      # if: always() 是关键：被 timeout 掐掉时 Maven 已经写完的报告依然有效
+      #（上一次 run 里第 5 步被 cancel，后面的 upload 步骤照样跑了），
+      # 所以这一步在「红」的那次上同样有输出——上一次就是因为没有它，
+      # 只能靠 artifact 大小去倒推时间花在哪。
+      #
+      # continue-on-error：这一步只做诊断，它自己出错不该把一次绿构建染红。
+      # ================================================================
+      - name: 测试耗时排行 + 失败原因（无论成败都打印）
+        if: always()
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+
+          rows, bad = [], []
+          for f in glob.glob('**/target/*-reports/*.xml', recursive=True):
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception:
+                  continue
+              if root.get('time') is None:      # failsafe-summary.xml 这类没有耗时
+                  continue
+              rows.append((float(root.get('time')), root.get('name') or '?',
+                           root.get('tests'), root.get('failures'), root.get('errors')))
+              for case in root.iter('testcase'):
+                  for kind in ('failure', 'error'):
+                      for e in case.findall(kind):
+                          msg = ' '.join((e.get('message') or '').split())[:240]
+                          bad.append((kind.upper(), case.get('classname'),
+                                      case.get('name'), msg))
+
+          rows.sort(reverse=True)
+          print('%-9s  %-56s %5s %5s %5s' % ('sec', 'test class', 'tests', 'fail', 'err'))
+          for t, n, tc, fa, er in rows:
+              print('%9.1f  %-56s %5s %5s %5s' % (t, n, tc, fa, er))
+          print('--- total %.0f s over %d classes ---' % (sum(r[0] for r in rows), len(rows)))
+
+          if bad:
+              print('')
+              print('=== failures and errors ===')
+              for kind, cls, name, msg in bad:
+                  print('[%s] %s.%s: %s' % (kind, cls, name, msg))
+          PY
 
       - uses: actions/upload-artifact@v4
         if: always()

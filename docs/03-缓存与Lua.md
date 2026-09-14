@@ -11,15 +11,21 @@
 | `seckill:stock:{1001:2001}` | String | 可售库存整数 | 活动结束 + 1h |
 | `seckill:bought:{1001:2001}` | Hash | `userId → 已购数量` | 活动结束 + 24h |
 | `seckill:req:{1001:2001}:R2026...` | Hash | 请求处理结果 | 30 min |
-| `seckill:released:{1001:2001}` | Set | 已回补的 orderNo | 活动结束 + 24h |
-| `activity:detail:1001` | String | 活动详情 JSON（含逻辑过期） | 2h ± 10min |
-| `activity:list:page:1` | String | 活动列表 JSON | 5 min |
-| `sku:detail:2001` | String | SKU 详情 JSON | 2h ± 10min |
-| `rate:user:{uid}:{aid}` | String | 用户令牌桶 | 2s |
-| `rate:ip:{ip}` | String | IP 令牌桶 | 2s |
-| `rate:activity:{aid}` | String | 活动令牌桶 | 2s |
+| `seckill:released:{1001:2001}` | Set | 已回补的 orderNo | 回补时刻 + 25h |
+| `activity:detail:1001` | String | 活动详情 JSON（含逻辑过期） | 逻辑 2h；物理另加 30min 缓冲 + 0~10min 抖动 |
+| `rate:user:{uid}:{aid}` | String | 用户令牌桶 | 4s |
+| `rate:ip:{ip}` | String | IP 令牌桶 | 4s |
+| `rate:activity:{aid}` | String | 活动令牌桶 | 4s |
 | `seckill:token:{uid}:{aid}:{sid}` | String | 秒杀令牌 | 5 min |
-| `lock:warmup:1001` | String | 预热分布式锁 | 5 min |
+| `lock:warmup:1001` | String | 预热分布式锁 | 120s |
+
+> `seckill:released` 的 TTL 是**调用时刻 + 25h**（`fss.seckill.released-ttl`），
+> 不是"活动结束 + 24h"——脚本里用的是调用时传进来的秒数，没有读 `endTime`。
+> 两者差一天以内，对"活动结束后才能安全清理"这个用途没有影响，但别按它推算
+> 活动结束后多久能回收。
+>
+> `rate:*` 的桶 TTL 由脚本算：`ceil(capacity / rate) + 2`，而调用方传的
+> `capacity = qps × burst-factor`（默认 2）、`rate = qps`，所以是 `ceil(2) + 2 = 4` 秒。
 
 > **`seckill:bought` 的 TTL 必须由脚本自己设。** 这个 Hash 是 `HINCRBY` 惰性创建的，
 > 预热阶段无法预先建一个空 Hash（Redis 里空 Hash 不存在），所以预热写不进 TTL。
@@ -454,27 +460,69 @@ public class SeckillExecutor {
 @Scheduled(cron = "${fss.job.warmup-cron:0 * * * * ?}")
 @DistributedLock(key = "warmup", leaseSeconds = 120)
 public void warmup() {
-    LocalDateTime deadline = LocalDateTime.now().plus(props.getSeckill().getWarmupAhead());
-    List<SeckillActivity> list = activityMapper.selectReadyBefore(deadline);
-    for (SeckillActivity a : list) {
-        try {
-            warmupService.warmupOne(a.getId());
-        } catch (Exception e) {
-            log.error("预热失败 activityId={}", a.getId(), e);
-            activityMapper.updateWarmupState(a.getId(), WarmupState.FAILED);
-            alarm.send("活动预热失败", a.getId());
-        }
+    LocalDateTime now = LocalDateTime.now();
+    LocalDateTime deadline = now.plus(props.getSeckill().getWarmupAhead());
+    List<SeckillActivity> list = activityMapper.selectNeedWarmup(deadline, now);
+    if (list.isEmpty()) {
+        return;
+    }
+
+    List<Callable<Void>> tasks = list.stream()
+            .map(a -> TraceContext.wrap((Callable<Void>) () -> {
+                warmUp(a.getId());      // 单个失败只影响它自己
+                return null;
+            }))
+            .toList();
+
+    // 必须阻塞到全部结束：warmup_state = DONE 是活动进入 RUNNING 的前置条件。
+    // 不等完就返回，会出现"活动已经能被抢、而 Redis 里还没有库存"的窗口
+    pool.invokeAll(tasks);
+}
+
+/** 失败不抛出——抛出会让 invokeAll 的调用方拿不到其余任务的结果，失败隔离就此失效 */
+private boolean warmUp(long activityId) {
+    try {
+        warmupService.warmupOne(activityId);
+        return true;
+    } catch (Exception e) {
+        metrics.jobError("warmup");
+        alarm.p2(AlarmService.Event.WARMUP_FAILED, String.valueOf(activityId),
+                "活动预热失败，不会进入进行中: " + e.getMessage());
+        warmupService.markFailed(activityId);    // 置 FAILED，下一轮任务会自动重试
+        return false;
     }
 }
 ```
 
+**批内并发，不是串行。** 活动之间没有依赖（唯一的共享点是每个活动自己那把预热锁），
+并发度由 `fss.job.warmup-concurrency` 控制（默认 4）。串行预热的风险随活动数线性放大：
+一场活动几十个 SKU，每个都要一次 DB 往返加若干次 Redis 写入，串行很容易吃掉整个
+`warmup-ahead` 窗口，表现是"到点了还没预热完，用户拿到未预热"。
+
+线程池是 `WarmupJob` 自建的（不复用 `spring.task.scheduling` 那个 4 线程池——那会让
+预热挤掉降级开关刷新），拒绝策略是 **`CallerRunsPolicy`**：队列满时让提交线程自己跑，
+退化成串行。慢，但不会漏掉任何一个活动。这与 `LogicalExpiryCache` 重建池的
+`DiscardPolicy` 刻意相反：那边丢一次重建没有损失，这边丢一个活动它就永远进不了进行中。
+
 `warmupOne` 的关键约束：**可重复执行，但不能把已扣减的库存重置回初始值。**
 
 ```java
-@Transactional(readOnly = true)
 public void warmupOne(long activityId) {
+    // 加锁只是为了减少无谓的重复工作；正确性完全由 setIfAbsent 保证——
+    // 就算锁失效、两个实例同时预热，结果也是对的
+    boolean ran = lockService.tryRun(RedisKeys.warmupLock(activityId), 120,
+            () -> doWarmup(activityId));
+    if (!ran) {
+        log.info("stage=WARMUP activityId={} result=SKIP 其他实例正在预热", activityId);
+    }
+}
+
+private void doWarmup(long activityId) {
     SeckillActivity act = activityMapper.selectById(activityId);
-    require(act != null && act.getStatus() == ActivityStatus.READY.code(), "活动状态不允许预热");
+    // READY 与 RUNNING 都允许：活动进行中重新预热是合法的运维动作
+    //（元数据被误改、Redis 主从切换后需要补数据）
+    require(act != null && (act.getStatus() == ActivityStatus.READY.code()
+            || act.getStatus() == ActivityStatus.RUNNING.code()), "活动状态不允许预热");
 
     List<SeckillGoods> goodsList = goodsMapper.selectByActivity(activityId);
     require(!goodsList.isEmpty(), "活动无商品");
@@ -620,10 +668,17 @@ record CacheWrapper<T>(T data, long expireAt, boolean nullValue) {
 的 sentinel profile（1 主 2 从 3 哨兵）。
 注意别和 `fss.sentinel` 搞混，那个是阿里 Sentinel 流控。
 
-TTL 抖动实现：
+TTL 抖动实现。注意抖动的对象是**物理 TTL**，而物理 TTL 还要在逻辑 TTL 之上
+再加一段 `cache-physical-buffer`（默认 30 分钟）——那段缓冲是给单飞重建留的窗口，
+逻辑过期之后、物理过期之前，读到旧值的请求会触发一次重建：
 
 ```java
-Duration ttl = props.getSeckill().getCacheTtl()
-        .plusSeconds(ThreadLocalRandom.current()
-                .nextInt((int) props.getSeckill().getCacheTtlJitter().toSeconds()));
+Duration physical = logical
+        .plus(props.getSeckill().getCachePhysicalBuffer())    // 默认 30 min
+        .plusSeconds(jitterSeconds());
+
+private long jitterSeconds() {
+    long max = props.getSeckill().getCacheTtlJitter().toSeconds();
+    return max <= 0 ? 0 : ThreadLocalRandom.current().nextLong(max);
+}
 ```

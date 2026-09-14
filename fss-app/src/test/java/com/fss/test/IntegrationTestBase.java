@@ -128,6 +128,57 @@ public abstract class IntegrationTestBase {
         MQ_NAMESRV.start();
         MQ_BROKER.start();
         flushRedis();
+        assertMqReachable();
+    }
+
+    /**
+     * 断言两个 MQ 容器的宿主端口真的能连上。
+     *
+     * <p><b>为什么必须要这一步。</b>容器起来但端口连不上的症状极具迷惑性：
+     * 每一次 {@code ReliableMqProducer.sendReliable} 抛
+     * {@code RemotingConnectException}，失败的请求停在 PENDING，而
+     * {@code TestFixture.AWAIT} 是"超时才抛"的轮询——于是<b>每一个</b>
+     * {@code submitAndAwait} / {@code awaitOrders} 都烧满整整 60 秒才失败。
+     *
+     * <p>CI 上真发生过一次：broker 的 127.0.0.1:10921 全程无监听（2344 次
+     * {@code RemotingConnectException}），而 namesrv 的 9877 一次都没失败——
+     * 两个容器用的是同一套端口绑定写法。后果是 9 个测试类、37 个用例连环失败，
+     * <b>纯等待就烧掉 36 分钟</b>，把 job 的 40 分钟超时吃满，而日志里没有一行
+     * 直接说"broker 连不上"。
+     *
+     * <p>所以这里在容器刚起来时就主动连一次：连不上立刻抛，几秒内失败，
+     * 而不是让 18 个测试类各自慢慢烧完 60 秒。
+     *
+     * <p>先查容器死活再查端口，是为了把两种原因分开——"启动后崩了"和
+     * "端口没发布"要看的日志完全不同，混在一起猜会浪费很多时间。
+     */
+    private static void assertMqReachable() {
+        assertRunning(MQ_NAMESRV, "namesrv");
+        assertRunning(MQ_BROKER, "broker");
+        assertTcp(MQ_NAMESRV_PORT, "namesrv");
+        assertTcp(MQ_BROKER_PORT, "broker");
+    }
+
+    /** 容器还活着吗。分开判才能区分"崩了"和"端口没发布" */
+    private static void assertRunning(GenericContainer<?> c, String what) {
+        if (!c.isRunning()) {
+            throw new IllegalStateException(
+                    what + " 容器启动后已经不在运行了。看容器日志找崩溃原因"
+                            + "（docker logs " + c.getContainerId() + "），"
+                            + "RocketMQ broker 的日志默认写在容器内 ~/logs/rocketmqlogs/ 下");
+        }
+    }
+
+    private static void assertTcp(int port, String what) {
+        try (java.net.Socket s = new java.net.Socket()) {
+            s.connect(new java.net.InetSocketAddress("127.0.0.1", port), 5000);
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    what + " 的宿主端口 127.0.0.1:" + port + " 连不上，集成测试必然"
+                            + "全军覆没（每个异步等待都会烧满 60 秒）。容器还在运行却连不上，"
+                            + "说明端口没发布——检查 " + what + " 的 withPortBindings 是否生效"
+                            + "（docker port " + what + " 容器 id），以及端口是否被别的东西占了", e);
+        }
     }
 
     /**
