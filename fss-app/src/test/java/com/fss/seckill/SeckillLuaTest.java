@@ -127,9 +127,15 @@ class SeckillLuaTest extends IntegrationTestBase {
         List<Long> users = fixture.createUsers(200);
 
         // 只改 Redis 里的结束时间到"刚刚"，DB 的时间窗口保持开着。
-        // 这样能证明拒绝确实来自 Lua 而不是别处的兜底校验
+        // 这样能证明拒绝确实来自 Lua 而不是别处的兜底校验。
+        //
+        // 基准必须取 Redis 自己的时钟：Lua 的时间校验读的是 Redis TIME，
+        // 而容器时钟可能比 JVM 慢一秒以上（实测 1.0~1.6 秒）。
+        // 用 LocalDateTime.now() 写这个"刚刚结束"的窗口，偏差一旦超过余量，
+        // 窗口在 Redis 看来仍是开的，测试会以"活动已结束却全部下单成功"的形式误报
+        LocalDateTime redisNow = fixture.redisNow();
         fixture.overrideRedisWindow(act.activityId(), act.skuId(),
-                LocalDateTime.now().minusHours(1), LocalDateTime.now().minusSeconds(1));
+                redisNow.minusHours(1), redisNow.minusSeconds(1));
 
         Burst.Result r = Burst.run(200, 32,
                 i -> seckillService.submit(

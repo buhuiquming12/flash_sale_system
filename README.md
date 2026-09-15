@@ -34,7 +34,7 @@
 | 缓存 | Redis 7.2 + Lettuce（Lua 与读写）+ Redisson（分布式锁） |
 | 消息队列 | Apache RocketMQ 5.3.0 + rocketmq-spring-boot-starter 2.3.1 |
 | 限流熔断 | Nginx `limit_req` + Sentinel 1.8.x + Redis Lua 令牌桶 |
-| 认证 | Spring Security 6 + JWT |
+| 认证 | JJWT 0.12.6 + Spring Security Crypto（仅取 BCrypt）；鉴权为自研 Servlet Filter |
 | 可观测 | Micrometer + Prometheus 2.54 + Grafana 11.2 |
 | 接口文档 | Springdoc OpenAPI 2.x |
 | 演示前端 | Vue 3.5 + Vite 7 + TypeScript 5.9 + Element Plus 2.14（`fss-web/`，独立进程） |
@@ -657,9 +657,11 @@ Redis 与 Lettuce / Redisson 的分工是刻意的：Lua 与普通读写走 Lett
   少卖可以人工修，超卖要赔钱。差额留给库存对账发现。
 - **限购固定为 1**，所以资格对账回补时 `quantity` 写死 1。支持 >1 时必须从
   `t_seckill_request` 或消息体读真实数量，否则会回补错数量。
-- **补偿回补目前是直接调用而非发消息**。`FSS_STOCK_ROLLBACK` 的生产者与消费者都已
-  就位（重发放弃、死信兜底两条路径），但主链路上的确定性失败是消费端就地回补的——
-  它已经在自己的线程里，多绕一次 MQ 只增加延迟。
+- **补偿回补目前是直接调用而非发消息**。`FSS_STOCK_ROLLBACK` **只有消费者、没有生产者**：
+  重发放弃与死信兜底两条路径都是就地直接调 `compensateService.rollback` 的——
+  它已经在自己的线程里，多绕一次 MQ 只增加延迟。消费者与主题保留下来，
+  是为了让故障演练 F11（重投该主题验证脚本 B 幂等）仍可手动执行。
+  排查问题时不要去找它的生产端，它不存在。
 - **Redis 令牌串错误时令牌也会被消费**。`GETDEL` 没有"比对不上就别删"这个选项，
   这是接受它的原子性所付的代价。key 由已认证的 userId 推出，攻击者只能作废自己的令牌。
 "# flash_sale_system" 

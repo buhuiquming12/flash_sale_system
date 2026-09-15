@@ -38,16 +38,18 @@ public class SeckillCompensateService {
      * 回补一条请求。
      *
      * @param ec 落库失败的错误码，决定 {@code keepBought} 与请求终态
-     * @return true 表示本次真的回补了；false 表示幂等命中（已回补过或已是终态）
+     * @return 见 {@link RollbackOutcome}。调用方<b>必须</b>区分
+     *         {@code ALREADY_DONE}（重复投递，正常）与 {@code FAILED}（库存可能泄漏，要告警）
      */
-    public boolean rollback(OrderCreateMessage msg, ErrorCode ec, String reason) {
+    public RollbackOutcome rollback(OrderCreateMessage msg, ErrorCode ec, String reason) {
         boolean keepBought = keepBought(ec);
         SeckillRequestStatus status = failStatusOf(ec);
 
-        boolean done = executor.rollback(msg.getActivityId(), msg.getSkuId(), msg.getUserId(),
-                msg.getQuantity(), msg.getRequestNo(), ec.getMessage(), keepBought, status);
+        RollbackOutcome outcome = executor.rollback(msg.getActivityId(), msg.getSkuId(),
+                msg.getUserId(), msg.getQuantity(), msg.getRequestNo(), ec.getMessage(),
+                keepBought, status);
         recordFailure(msg, status, reason);
-        return done;
+        return outcome;
     }
 
     /**

@@ -1,5 +1,6 @@
 package com.fss.biz.consumer;
 
+import com.fss.biz.seckill.core.RollbackOutcome;
 import com.fss.biz.seckill.core.SeckillExecutor;
 import com.fss.common.trace.TraceContext;
 import com.fss.common.util.JsonUtil;
@@ -66,17 +67,20 @@ public class StockReleaseListener implements RocketMQListener<MessageExt> {
 
         TraceContext.set(msg.getTraceId());
         try {
-            // executor.release 内部把 Redis 异常吞掉并返回 false —— 那是给
-            // "提交后回调"用的语义（那里抛了也无处可去）。消费端要的是相反的：
-            // 失败必须让 MQ 重投，所以这里显式检查 Redis 里的结果
-            boolean done = executor.release(msg.getActivityId(), msg.getSkuId(),
+            RollbackOutcome outcome = executor.release(msg.getActivityId(), msg.getSkuId(),
                     msg.getOrderNo(), msg.getQuantity());
-            if (!done && !alreadyReleased(msg)) {
+            // ALREADY_DONE 是脚本 C 的幂等命中（正常的重复投递），必须 ACK；
+            // 只有 FAILED（Redis 调用失败，回补结果未知）才让 MQ 重投。
+            //
+            // 早先 release 返回 boolean 时这两者分不开，只能再用一次
+            // executor.isReleased() 去 Redis 里回查 —— 现在结果本身就带在返回值里，
+            // 那次多余的往返与那个查询方法都去掉了
+            if (outcome.isFailed()) {
                 throw new IllegalStateException(
                         "Redis 库存回补未生效: orderNo=" + msg.getOrderNo());
             }
-            log.info("stage=STOCK_RELEASE_MQ orderNo={} qty={} done={} reconsume={}",
-                    msg.getOrderNo(), msg.getQuantity(), done, ext.getReconsumeTimes());
+            log.info("stage=STOCK_RELEASE_MQ orderNo={} qty={} outcome={} reconsume={}",
+                    msg.getOrderNo(), msg.getQuantity(), outcome, ext.getReconsumeTimes());
             markConsumed(ext);
 
         } catch (Exception e) {
@@ -86,18 +90,6 @@ public class StockReleaseListener implements RocketMQListener<MessageExt> {
         } finally {
             TraceContext.clear();
         }
-    }
-
-    /**
-     * 区分"回补失败"与"早就回补过了"。
-     *
-     * <p>脚本 C 对两者都返回非 0：幂等命中返回 1，而 Redis 抛异常时
-     * {@code executor.release} 返回 false。前者是正常的重复投递，
-     * 必须 ACK；后者必须重试。分不开的话，重复投递会被当成失败无限重试，
-     * 最后整批进死信 —— 一个纯粹由"把幂等命中误判成失败"造出来的故障。
-     */
-    private boolean alreadyReleased(StockReleaseMessage msg) {
-        return executor.isReleased(msg.getActivityId(), msg.getSkuId(), msg.getOrderNo());
     }
 
     private void markConsumed(MessageExt ext) {

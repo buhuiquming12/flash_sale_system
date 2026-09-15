@@ -146,6 +146,9 @@ fss:
     key-ttl-after-end: 1h         # 活动结束后 Redis key 再留多久（供轮询与对账）
     released-ttl: 25h             # 已回补订单号 Set 的 TTL，必须覆盖活动结束后的关单
     allow-repurchase-after-cancel: false   # 决策 1，启动时断言必须为 false
+    # 默认要求携带秒杀令牌。压测/演示若要走固定路径 /api/seckill/do，
+    # 只在 application-dev.yml / application-perf.yml 里打开，生产保持 false
+    allow-tokenless-submit: false
   ratelimit:
     enabled: true
     user-qps: 2
@@ -203,7 +206,7 @@ fss:
     ttl: 2h
     issuer: fss
   pay:
-    notify-secret: ${FSS_PAY_SECRET:fss-mock-pay-secret-change-me}
+    notify-secret: ${FSS_PAY_SECRET:fss-mock-pay-secret-change-me-in-prod}
     notify-tolerance: 5m
   job:
     close-expired-cron: "0 */2 * * * ?"

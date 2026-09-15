@@ -13,6 +13,9 @@ import java.util.stream.Collectors;
  */
 public final class PaySignUtil {
 
+    /** 与 {@code JwtService} 对 JWT 密钥的要求保持一致 */
+    private static final int MIN_SECRET_LENGTH = 32;
+
     private PaySignUtil() {
     }
 
@@ -43,6 +46,14 @@ public final class PaySignUtil {
     }
 
     private static String hmacSha256(String content, String secret) {
+        // 密钥过短会让 HMAC 的强度形同虚设，而伪造回调的后果是用户不付钱就能把订单
+        // 置为已支付——直接资损。这里与 JwtService 对称地校验，不放任 null 走到
+        // SecretKeySpec 才炸出一句看不出所以然的异常
+        if (secret == null || secret.length() < MIN_SECRET_LENGTH) {
+            throw new IllegalStateException("fss.pay.notify-secret 至少需要 "
+                    + MIN_SECRET_LENGTH + " 字节，当前 "
+                    + (secret == null ? "未配置" : secret.length() + " 字节"));
+        }
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
             mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));

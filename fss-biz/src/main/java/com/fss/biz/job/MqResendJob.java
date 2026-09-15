@@ -1,6 +1,7 @@
 package com.fss.biz.job;
 
 import com.fss.biz.mq.ReliableMqProducer;
+import com.fss.biz.seckill.core.RollbackOutcome;
 import com.fss.biz.seckill.core.SeckillCompensateService;
 import com.fss.common.error.ErrorCode;
 import com.fss.common.trace.TraceContext;
@@ -124,17 +125,30 @@ public class MqResendJob {
         try {
             OrderCreateMessage msg = JsonUtil.parse(rec.getBody(), OrderCreateMessage.class);
             TraceContext.set(msg.getTraceId());
-            boolean done = compensateService.rollback(msg, ErrorCode.SYSTEM_BUSY,
+            RollbackOutcome outcome = compensateService.rollback(msg, ErrorCode.SYSTEM_BUSY,
                     "订单消息投递失败，已退回");
-            log.error("stage=MQ_GIVE_UP msgId={} requestNo={} autoRollback={} 已告警",
-                    rec.getMsgId(), msg.getRequestNo(), done);
-            alarm.p2(AlarmService.Event.MQ_GIVE_UP, msg.getRequestNo(),
-                    "订单创建消息投递放弃，已自动回补=" + done);
+            if (outcome.isFailed()) {
+                // 回补本身失败了：库存还占着，而这条消息已经不会再重发。
+                // 这是设计里唯一一处"必须 P1"的场景，之前写在一个永远不会进入的
+                // catch 块里（rollback 把异常吞了），实际只会走下面那条 P2
+                log.error("stage=MQ_GIVE_UP msgId={} requestNo={} result=ROLLBACK_FAILED 库存泄漏",
+                        rec.getMsgId(), msg.getRequestNo());
+                alarm.p1(AlarmService.Event.MQ_GIVE_UP, msg.getRequestNo(),
+                        "订单创建消息投递放弃且回补失败，库存泄漏");
+            } else {
+                log.error("stage=MQ_GIVE_UP msgId={} requestNo={} autoRollback={} 已告警",
+                        rec.getMsgId(), msg.getRequestNo(), outcome);
+                alarm.p2(AlarmService.Event.MQ_GIVE_UP, msg.getRequestNo(),
+                        "订单创建消息投递放弃，已自动回补=" + outcome);
+            }
         } catch (Exception e) {
-            log.error("stage=MQ_GIVE_UP msgId={} bizKey={} result=ROLLBACK_FAILED 转人工",
+            // 能走到这里的只有消息体解析失败（脏数据）：compensateService.rollback 内部
+            // 把 Redis 异常转成了 FAILED 返回值、recordFailure 自己吞异常、alarm 也吞，
+            // 都不会抛出来。解析不出来等于回补根本没执行，库存一定还占着，同样按 P1 处理
+            log.error("stage=MQ_GIVE_UP msgId={} bizKey={} result=PARSE_FAILED 转人工",
                     rec.getMsgId(), rec.getBizKey(), e);
             alarm.p1(AlarmService.Event.MQ_GIVE_UP, rec.getBizKey(),
-                    "订单创建消息投递放弃且回补失败，库存泄漏");
+                    "订单创建消息投递放弃且消息体无法解析，库存未回补需人工");
         } finally {
             TraceContext.clear();
         }

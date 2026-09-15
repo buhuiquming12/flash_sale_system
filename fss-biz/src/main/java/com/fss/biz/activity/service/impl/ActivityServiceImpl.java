@@ -2,6 +2,9 @@ package com.fss.biz.activity.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.alibaba.csp.sentinel.annotation.SentinelResource;
+import com.alibaba.csp.sentinel.slots.block.BlockException;
+import com.alibaba.csp.sentinel.slots.block.degrade.DegradeException;
 import com.fss.biz.activity.model.ActivityCreateCmd;
 import com.fss.biz.activity.model.ActivityDetailVO;
 import com.fss.biz.activity.model.ActivityListItemVO;
@@ -26,6 +29,7 @@ import com.fss.domain.mapper.SeckillActivityMapper;
 import com.fss.domain.mapper.SeckillGoodsMapper;
 import com.fss.domain.mapper.StockLogMapper;
 import com.fss.infra.cache.LogicalExpiryCache;
+import com.fss.infra.config.SentinelConfig;
 import com.fss.infra.degrade.DegradeSwitch;
 import com.fss.infra.redis.RedisKeys;
 import com.fss.infra.tx.TxSupport;
@@ -250,7 +254,18 @@ public class ActivityServiceImpl implements ActivityService {
         return PageR.of(p.getTotal(), page, size, list);
     }
 
+    /**
+     * {@code exceptionsToIgnore = BizException.class} 是这段集成里最关键的一行。
+     *
+     * <p>不写它的话，下面这条 {@code Assert.requireFound(..., ACTIVITY_NOT_FOUND)}
+     * 就会把"活动不存在/未开始"计入异常比例 —— 爬虫扫一遍不存在的 ID 就能把
+     * 异常比例推到 100%，几秒内熔断整个详情接口。降级开关触发的
+     * {@code SERVICE_DEGRADED} 同理。业务失败不是故障，不能进故障统计。
+     */
     @Override
+    @SentinelResource(value = SentinelConfig.RES_ACTIVITY_DETAIL,
+            blockHandler = "onDetailBlocked",
+            exceptionsToIgnore = BizException.class)
     public ActivityDetailVO detail(long activityId) {
         // 参数校验是防穿透的第一道：ID 非正数的请求连缓存都不必查
         Assert.require(activityId > 0, ErrorCode.ACTIVITY_NOT_FOUND);
@@ -265,6 +280,31 @@ public class ActivityServiceImpl implements ActivityService {
         Assert.requireFound(cached, ErrorCode.ACTIVITY_NOT_FOUND);
 
         return withVolatileFields(cached);
+    }
+
+    /**
+     * Sentinel 流控 / 熔断触发。签名 = 原方法 + {@code BlockException}。
+     *
+     * <p>区分两者，因为客户端该做的反应相反：
+     * <ul>
+     *   <li><b>流控</b>（{@code FlowException}）：请求太密，回 429 + 让客户端退避</li>
+     *   <li><b>熔断</b>（{@code DegradeException}）：回源真的在出问题，
+     *       回 503 —— 与项目其它降级路径一致，客户端看到 503 才知道不该立刻重试</li>
+     * </ul>
+     *
+     * <p>这两条规则（{@code SentinelConfig:103} 的 3000 QPS 与 {@code :131} 的
+     * 异常比例熔断）此前挂在资源名 {@code activity:detail} 上，但没有任何方法标注它，
+     * 等于一直空转。挂到这里之后它们才第一次真正生效。
+     */
+    public ActivityDetailVO onDetailBlocked(long activityId, BlockException e) {
+        if (e instanceof DegradeException) {
+            log.warn("stage=ACTIVITY_DETAIL activityId={} result=DEGRADED by={}",
+                    activityId, e.getClass().getSimpleName());
+            throw new BizException(ErrorCode.SERVICE_DEGRADED, "活动详情暂时不可用，请稍后再试");
+        }
+        log.warn("stage=ACTIVITY_DETAIL activityId={} result=BLOCKED by={}",
+                activityId, e.getClass().getSimpleName());
+        throw new BizException(ErrorCode.RATE_LIMITED, "查询过于频繁，请稍后再试");
     }
 
     /**

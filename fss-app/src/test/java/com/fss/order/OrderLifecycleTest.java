@@ -18,6 +18,7 @@ import com.fss.common.error.ErrorCode;
 import com.fss.test.IntegrationTestBase;
 import com.fss.test.TestFixture;
 import org.junit.jupiter.api.DisplayName;
+import com.fss.infra.config.FssProperties;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -43,6 +44,7 @@ class OrderLifecycleTest extends IntegrationTestBase {
     @Autowired OrderService   orderService;
     @Autowired PaymentService paymentService;
     @Autowired TestFixture    fixture;
+    @Autowired FssProperties  props;
 
     @Test
     @DisplayName("取消订单 → 库存回补，locked 归零，released 累计")
@@ -224,7 +226,7 @@ class OrderLifecycleTest extends IntegrationTestBase {
         params.put("timestamp",
                 String.valueOf(System.currentTimeMillis() - TimeUnit.MINUTES.toMillis(10)));
         params.put("sign", com.fss.biz.payment.core.PaySignUtil.sign(
-                params, "fss-integration-test-pay-secret"));
+                params, props.getPay().getNotifySecret()));
 
         assertThatThrownBy(() -> notify(params))
                 .isInstanceOf(BizException.class)

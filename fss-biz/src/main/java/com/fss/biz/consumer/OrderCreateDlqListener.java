@@ -1,5 +1,6 @@
 package com.fss.biz.consumer;
 
+import com.fss.biz.seckill.core.RollbackOutcome;
 import com.fss.biz.seckill.core.SeckillCompensateService;
 import com.fss.common.enums.ReconcileTaskStatus;
 import com.fss.common.enums.ReconcileTaskType;
@@ -82,13 +83,24 @@ public class OrderCreateDlqListener implements RocketMQListener<MessageExt> {
             // 进了死信说明消费端已经试过 5 次都不成，原因未知（可能是 DB 长期不可用、
             // 也可能是一条永远处理不了的脏数据）。无论哪种，库存不能继续被占着。
             // keepBought = false：用户没有责任，资格还给他，让他能重抢
-            boolean done = compensateService.rollback(msg, ErrorCode.SYSTEM_BUSY,
+            RollbackOutcome outcome = compensateService.rollback(msg, ErrorCode.SYSTEM_BUSY,
                     "消息进入死信队列，已自动回补");
-            log.error("stage=DLQ requestNo={} autoRollback={} 已告警", msg.getRequestNo(), done);
+            if (outcome.isFailed()) {
+                // 死信里的回补也失败了：没有更后面的兜底了，只能靠库存对账，
+                // 所以按 P1 报出来，别混在正常的"已自动回补"里
+                log.error("stage=DLQ requestNo={} result=ROLLBACK_FAILED 库存泄漏", msg.getRequestNo());
+                alarm.p1(AlarmService.Event.MQ_DLQ, msg.getRequestNo(),
+                        "死信消息回补失败，库存泄漏");
+            } else {
+                log.error("stage=DLQ requestNo={} autoRollback={} 已告警",
+                        msg.getRequestNo(), outcome);
+            }
         } catch (Exception e) {
             // 死信的死信没有归宿。绝不能抛
             log.error("stage=DLQ requestNo={} result=ROLLBACK_FAILED 转人工",
                     msg.getRequestNo(), e);
+            alarm.p1(AlarmService.Event.MQ_DLQ, msg.getRequestNo(),
+                    "死信消息回补异常，库存未回补需人工");
         } finally {
             TraceContext.clear();
         }

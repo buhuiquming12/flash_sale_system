@@ -2,9 +2,8 @@ package com.fss.app.interceptor;
 
 import com.fss.common.context.UserContext;
 import com.fss.common.error.ErrorCode;
-import com.fss.common.result.R;
 import com.fss.common.util.IpUtil;
-import com.fss.common.util.JsonUtil;
+import com.fss.common.web.ErrorResponseWriter;
 import com.fss.infra.config.FssProperties;
 import com.fss.infra.ratelimit.RateLimiter;
 import com.fss.infra.redis.RedisKeys;
@@ -12,10 +11,13 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.HandlerInterceptor;
+import org.springframework.web.servlet.HandlerMapping;
 
 import java.io.IOException;
+import java.util.Map;
 
 /**
  * Redis 令牌桶限流拦截器（四级限流的第三级）。
@@ -100,7 +102,12 @@ public class RateLimitInterceptor implements HandlerInterceptor {
     /**
      * 从请求里取 activityId。
      *
-     * <p><b>只看查询参数，不读请求体。</b> Servlet 的输入流只能读一次，
+     * <p><b>查询串与路径变量都要看。</b> 秒杀领令牌、结果轮询把 {@code activityId}
+     * 放在查询串里（{@code /api/seckill/token?activityId=1001}），而活动详情是
+     * {@code /api/activity/{activityId}}——只认查询串的话，挂在 {@code /api/activity/**}
+     * 上的活动桶永远不会触发：详情的 id 在路径里，列表压根没这个参数。
+     *
+     * <p><b>只读查询参数与路径变量，不读请求体。</b> Servlet 的输入流只能读一次，
      * 在拦截器里把 body 读掉之后 Spring 就拿不到参数了（除非套一层
      * ContentCachingRequestWrapper，那要为每个请求多复制一份 body，
      * 在秒杀入口上是纯粹的浪费）。
@@ -111,7 +118,24 @@ public class RateLimitInterceptor implements HandlerInterceptor {
      * {@code activityId}，而不是在这里解析 body。
      */
     private Long extractActivityId(HttpServletRequest req) {
-        String v = req.getParameter("activityId");
+        Long fromQuery = toPositiveLong(req.getParameter("activityId"));
+        if (fromQuery != null) {
+            return fromQuery;
+        }
+        // 路径变量由 HandlerMapping 在选中 handler 时写入 request attribute，
+        // preHandle 阶段已经可用，不必自己按 URI 前缀硬拆字符串
+        Object attr = req.getAttribute(HandlerMapping.URI_TEMPLATE_VARIABLES_ATTRIBUTE);
+        if (attr instanceof Map<?, ?> vars) {
+            Object v = vars.get("activityId");
+            if (v != null) {
+                return toPositiveLong(String.valueOf(v));
+            }
+        }
+        return null;
+    }
+
+    /** 解析成正数，非数字、非正数、空白一律当作"拿不到" */
+    private Long toPositiveLong(String v) {
         if (v == null || v.isBlank()) {
             return null;
         }
@@ -133,11 +157,9 @@ public class RateLimitInterceptor implements HandlerInterceptor {
      */
     private boolean reject(HttpServletResponse resp, String msg, String detail) throws IOException {
         log.debug("stage=RATE_LIMIT result=REJECT {}", detail);
-        resp.setStatus(429);
         // 告诉客户端多久后再来，比让它立刻重试好——立刻重试只会让限流器更忙
         resp.setHeader("Retry-After", "1");
-        resp.setContentType("application/json;charset=UTF-8");
-        resp.getWriter().write(JsonUtil.toJson(R.fail(ErrorCode.RATE_LIMITED, msg)));
+        ErrorResponseWriter.write(resp, HttpStatus.TOO_MANY_REQUESTS, ErrorCode.RATE_LIMITED, msg);
         return false;
     }
 }

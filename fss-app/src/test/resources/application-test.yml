@@ -32,13 +32,27 @@ logging:
     com.github.dockerjava: WARN
 
 fss:
+  seckill:
+    # 集成测试直接调 Service，不经过 Web 层，也就没有"先调 /api/seckill/token 拿令牌"
+    # 这一步。绝大多数用例（Lua 判定、订单生命周期、并发、对账）要验的是它们自己的
+    # 语义，把令牌串进去只会让它们变成在测令牌。
+    #
+    # 显式打开而不是"靠空令牌静默跳过"，是为了让这件事在配置里看得见 ——
+    # 之前没有这个开关时，整套集成测试其实是跑在"令牌校验被静默跳过"的状态下，
+    # 没有任何地方写明这一点。
+    #
+    # 令牌本身没有被漏掉：准入规则由单测 SeckillTokenGateTest 锁住，
+    # 而"发真令牌 → 提交 → 拿到订单号"的端到端路径由 TokenAndJwtTest 覆盖。
+    allow-tokenless-submit: true
+
   order:
     pay-timeout: 15m
     close-scan-delay: 0s        # 测试里立即可扫
   jwt:
     secret: fss-integration-test-secret-at-least-32-bytes-long
   pay:
-    notify-secret: fss-integration-test-pay-secret
+    # 至少 32 字节，与 PaySignUtil 的校验保持一致
+    notify-secret: fss-integration-test-pay-secret-long-enough
   job:
     # 全部定时任务设成"每年 1 月 1 日"，测试期间不会自动触发，由用例显式调用。
     #

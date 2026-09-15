@@ -1,6 +1,7 @@
 package com.fss.biz.reconcile;
 
 import com.fss.biz.mq.ReliableMqProducer;
+import com.fss.biz.seckill.core.RollbackOutcome;
 import com.fss.biz.seckill.core.SeckillCompensateService;
 import com.fss.biz.seckill.core.SeckillExecutor;
 import com.fss.common.enums.MqStatus;
@@ -223,14 +224,23 @@ public class QualificationReconciler {
                 .traceId(traceId)
                 .version(OrderCreateMessage.CURRENT_VERSION)
                 .build();
-        boolean done = compensateService.rollback(msg, ErrorCode.SYSTEM_BUSY, reason);
+        RollbackOutcome outcome = compensateService.rollback(msg, ErrorCode.SYSTEM_BUSY, reason);
+        // ALREADY_DONE（幂等命中）也算修好了 —— 之前用 boolean 时它和"回补失败"
+        // 无法区分，于是一次正常的重复回补会被记成 NEED_MANUAL，
+        // 在工单列表里造出一条根本不存在的待办
+        boolean fixed = !outcome.isFailed();
         recorder.record(ReconcileTaskType.QUALIFICATION, requestNo, activityId, skuId,
                 detail("ORPHAN_ROLLBACK", requestNo, null, reason),
-                done ? ReconcileTaskStatus.AUTO_FIXED : ReconcileTaskStatus.NEED_MANUAL,
-                done ? "孤儿资格已回补: " + reason : "回补未生效（可能已是终态）: " + reason);
-        alarm.p2(AlarmService.Event.ORPHAN_QUALIFICATION, requestNo, reason);
-        log.warn("stage=RECONCILE_QUAL requestNo={} verdict=ROLLBACK done={} reason={}",
-                requestNo, done, reason);
+                fixed ? ReconcileTaskStatus.AUTO_FIXED : ReconcileTaskStatus.NEED_MANUAL,
+                fixed ? "孤儿资格已回补: " + reason : "回补失败，库存可能泄漏: " + reason);
+        if (fixed) {
+            alarm.p2(AlarmService.Event.ORPHAN_QUALIFICATION, requestNo, reason);
+        } else {
+            alarm.p1(AlarmService.Event.ORPHAN_QUALIFICATION, requestNo,
+                    "孤儿资格回补失败，库存泄漏: " + reason);
+        }
+        log.warn("stage=RECONCILE_QUAL requestNo={} verdict=ROLLBACK outcome={} reason={}",
+                requestNo, outcome, reason);
         clearRounds(requestNo);
     }
 

@@ -440,7 +440,7 @@ services:
       FSS_MQ_NAMESRV: rocketmq-namesrv:9876
       # 演示环境用默认弱密钥。生产必须由外部注入，见 application.yml 的注释
       FSS_JWT_SECRET: fss-local-dev-only-secret-change-me-in-prod
-      FSS_PAY_SECRET: fss-mock-pay-secret-change-me
+      FSS_PAY_SECRET: fss-mock-pay-secret-change-me-in-prod
       TZ: Asia/Shanghai
     ports:
       # 端口留在宿主机上不只是为了 curl 调试：prometheus.yml 抓的是

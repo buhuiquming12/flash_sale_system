@@ -66,9 +66,15 @@ public class SeckillController {
      * <p>保留它是为了压测与联调：JMeter 脚本不必先取令牌再拼路径，
      * 否则压测测的一半是令牌接口的性能。
      *
-     * <p><b>生产环境应当在网关层只放开动态路径</b>，把这个入口挡在外面。
-     * 代码里保留而部署时屏蔽，比为了安全把压测入口删掉、
-     * 然后每次压测再临时改代码要可靠。
+     * <p><b>由 {@code fss.seckill.allow-tokenless-submit} 控制，默认 false。</b>
+     * 关闭时本接口返回 403，客户端必须先走 {@code /api/seckill/token}。
+     * 只有 {@code dev} 与 {@code perf} profile 打开它。
+     *
+     * <p>早先这里只靠一行注释约定"生产应在网关层屏蔽"——那是把安全边界
+     * 寄托在部署配置上，而代码本身在任何环境下都是放行的。配置开关让
+     * 默认姿态变安全，压测能力仍然保留。
+     *
+     * <p>注意这与认证无关：本接口始终需要 JWT，约束的是"抢购资格"而不是"用户身份"。
      */
     @PostMapping("/do")
     public R<SeckillSubmitVO> submit(@Valid @RequestBody SeckillSubmitReq req) {

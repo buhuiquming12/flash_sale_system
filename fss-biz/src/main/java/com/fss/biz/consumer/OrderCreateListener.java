@@ -1,6 +1,7 @@
 package com.fss.biz.consumer;
 
 import com.fss.biz.order.service.OrderCreateService;
+import com.fss.biz.seckill.core.RollbackOutcome;
 import com.fss.biz.seckill.core.SeckillCompensateService;
 import com.fss.biz.seckill.core.SeckillExecutor;
 import com.fss.common.enums.SeckillRequestStatus;
@@ -11,6 +12,7 @@ import com.fss.common.util.JsonUtil;
 import com.fss.domain.entity.Order;
 import com.fss.domain.mapper.MqMessageMapper;
 import com.fss.domain.message.OrderCreateMessage;
+import com.fss.infra.alarm.AlarmService;
 import com.fss.infra.metrics.SeckillMetrics;
 import com.fss.infra.mq.MqTopics;
 import com.fss.infra.tx.TxSupport;
@@ -71,6 +73,7 @@ public class OrderCreateListener implements RocketMQListener<MessageExt> {
     private final SeckillExecutor          executor;
     private final MqMessageMapper          mqMapper;
     private final SeckillMetrics           metrics;
+    private final AlarmService             alarm;
 
     @Override
     public void onMessage(MessageExt ext) {
@@ -142,7 +145,16 @@ public class OrderCreateListener implements RocketMQListener<MessageExt> {
             if (ec.isDeterministic()) {
                 log.warn("stage=ORDER_CREATE requestNo={} result=DETERMINISTIC_FAIL code={} 立即回补",
                         msg.getRequestNo(), ec.name());
-                compensateService.rollback(msg, ec, ec.getMessage());
+                RollbackOutcome outcome = compensateService.rollback(msg, ec, ec.getMessage());
+                if (outcome.isFailed()) {
+                    // 确定性失败本来就是为了"尽快把库存还回去"才就地回补的，
+                    // 结果回补自己失败了 —— 这次没有 MQ 重试兜着（消息已经 ACK），
+                    // 只能靠库存对账发现，所以按 P1 报出来
+                    log.error("stage=ORDER_CREATE requestNo={} result=ROLLBACK_FAILED 库存泄漏",
+                            msg.getRequestNo());
+                    alarm.p1(AlarmService.Event.REDIS_UNCERTAIN, msg.getRequestNo(),
+                            "确定性失败后立即回补失败，库存可能泄漏");
+                }
                 markConsumed(ext);
                 return;
             }

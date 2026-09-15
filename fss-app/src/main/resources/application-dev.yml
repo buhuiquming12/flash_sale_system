@@ -7,3 +7,7 @@ logging:
 fss:
   job:
     close-expired-cron: "0 */5 * * * ?"
+  seckill:
+    # 演示页面的"跳过令牌"开关和本地压测都直接打固定路径 /api/seckill/do。
+    # 这是 dev 专属便利，生产 profile 不继承这个值
+    allow-tokenless-submit: true

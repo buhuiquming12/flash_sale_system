@@ -2,9 +2,7 @@ package com.fss.app.filter;
 
 import com.fss.common.context.UserContext;
 import com.fss.common.error.ErrorCode;
-import com.fss.common.result.R;
-import com.fss.common.trace.TraceContext;
-import com.fss.common.util.JsonUtil;
+import com.fss.common.web.ErrorResponseWriter;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -12,7 +10,6 @@ import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
@@ -34,7 +31,11 @@ public class AdminAuthFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        return !request.getRequestURI().startsWith("/api/admin/");
+        // OPTIONS 是 CORS 预检，浏览器按规范不会带 Authorization 头。不跳过的话
+        // 这里会因为 UserContext 为空而判 401，预检失败会让真实请求根本发不出去。
+        // JwtAuthFilter 已对 OPTIONS 放行，这里必须保持一致，否则预检仍被拦下。
+        return !request.getRequestURI().startsWith("/api/admin/")
+                || "OPTIONS".equalsIgnoreCase(request.getMethod());
     }
 
     @Override
@@ -42,23 +43,14 @@ public class AdminAuthFilter extends OncePerRequestFilter {
                                     FilterChain chain) throws ServletException, IOException {
         UserContext.Principal p = UserContext.current();
         if (p == null) {
-            write(resp, HttpStatus.UNAUTHORIZED, ErrorCode.UNAUTHORIZED, null);
+            ErrorResponseWriter.write(resp, HttpStatus.UNAUTHORIZED, ErrorCode.UNAUTHORIZED);
             return;
         }
         if (!p.isAdmin()) {
-            write(resp, HttpStatus.FORBIDDEN, ErrorCode.FORBIDDEN, "需要管理员权限");
+            ErrorResponseWriter.write(resp, HttpStatus.FORBIDDEN, ErrorCode.FORBIDDEN,
+                    "需要管理员权限");
             return;
         }
         chain.doFilter(req, resp);
-    }
-
-    private void write(HttpServletResponse resp, HttpStatus status,
-                       ErrorCode ec, String msg) throws IOException {
-        resp.setStatus(status.value());
-        resp.setContentType(MediaType.APPLICATION_JSON_VALUE);
-        resp.setCharacterEncoding("UTF-8");
-        R<Void> body = msg == null ? R.fail(ec) : R.fail(ec, msg);
-        body.setTraceId(TraceContext.get());
-        resp.getWriter().write(JsonUtil.toJson(body));
     }
 }

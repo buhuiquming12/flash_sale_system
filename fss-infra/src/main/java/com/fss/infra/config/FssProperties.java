@@ -70,6 +70,21 @@ public class FssProperties {
          * 形成"创建失败 → 补偿"死循环。
          */
         private boolean  allowRepurchaseAfterCancel = false;
+        /**
+         * 是否允许不携带令牌提交秒杀。
+         *
+         * <p>默认 {@code false}：秒杀提交必须先在 {@code /api/seckill/token} 取令牌。
+         * 令牌是一次性的（GETDEL 消费）且绑定 {@code userId + activityId + skuId}，
+         * 这是防脚本的主要手段——没有它，提交接口退化成一个"谁都能直接打"的入口。
+         *
+         * <p>打开会给压测与演示用：JMeter 脚本不必先取令牌再拼路径，
+         * 否则压测测的一半是令牌接口的性能。只应在 {@code dev} / {@code perf}
+         * profile 里打开，生产保持 false。
+         *
+         * <p>注意这与认证无关——{@code /api/seckill/do} 仍然需要 JWT，
+         * 这里约束的是"抢购资格"而不是"用户身份"。
+         */
+        private boolean  allowTokenlessSubmit = false;
     }
 
     @Data
@@ -176,18 +191,32 @@ public class FssProperties {
     @Data
     public static class Jwt {
         /**
-         * HMAC-SHA256 密钥，至少 32 字节。
-         * 生产必须由环境变量注入，配置文件里的默认值只用于本地开发。
+         * 本地开发的默认密钥。<b>只用于 {@code dev} profile</b>，生产必须由环境变量注入。
+         *
+         * <p>提成常量而不是直接写字面量，是为了让启动自检能识别"密钥还是这个默认值"——
+         * 自检要拒的就是它。字面量写两遍的话，改了一处忘了另一处，自检就静默失效了。
          */
-        private String   secret = "fss-local-dev-only-secret-change-me-in-prod";
+        public static final String DEV_DEFAULT_SECRET = "fss-local-dev-only-secret-change-me-in-prod";
+
+        /**
+         * HMAC-SHA256 密钥，至少 32 字节。
+         * 生产必须由环境变量 {@code FSS_JWT_SECRET} 注入。
+         */
+        private String   secret = DEV_DEFAULT_SECRET;
         private Duration ttl    = Duration.ofHours(2);
         private String   issuer = "fss";
     }
 
     @Data
     public static class Pay {
-        /** 模拟渠道回调验签密钥 */
-        private String   notifySecret   = "fss-mock-pay-secret-change-me";
+        /** 同 {@link Jwt#DEV_DEFAULT_SECRET}，供启动自检识别 */
+        public static final String DEV_DEFAULT_NOTIFY_SECRET = "fss-mock-pay-secret-change-me-in-prod";
+
+        /**
+         * 模拟渠道回调验签密钥，至少 32 字节。
+         * 生产必须由环境变量 {@code FSS_PAY_SECRET} 注入。
+         */
+        private String   notifySecret   = DEV_DEFAULT_NOTIFY_SECRET;
         /** 回调时间戳允许的偏差，防重放 */
         private Duration notifyTolerance = Duration.ofMinutes(5);
     }

@@ -133,11 +133,12 @@ public class SeckillExecutor {
      *                   {@code COMPENSATED} —— 设计文档一律写 5，而消费端同时会往
      *                   {@code t_seckill_request} 落一条具体码，同一个请求在 Redis
      *                   和 DB 里就有了两个不同的结论
-     * @return true 表示本次真的回补了；false 表示幂等命中（已回补过或状态不允许）
+     * @return 见 {@link RollbackOutcome}。调用方<b>必须</b>区分
+     *         {@code ALREADY_DONE}（重复投递，正常）与 {@code FAILED}（库存可能泄漏，要告警）
      */
-    public boolean rollback(long activityId, long skuId, long userId, int qty,
-                            String requestNo, String reason, boolean keepBought,
-                            SeckillRequestStatus failStatus) {
+    public RollbackOutcome rollback(long activityId, long skuId, long userId, int qty,
+                                    String requestNo, String reason, boolean keepBought,
+                                    SeckillRequestStatus failStatus) {
         List<String> keys = List.of(
                 RedisKeys.stock(activityId, skuId),
                 RedisKeys.bought(activityId, skuId),
@@ -151,20 +152,20 @@ public class SeckillExecutor {
                     keepBought ? "1" : "0",
                     String.valueOf(props.getSeckill().getResultTtl().toSeconds()),
                     String.valueOf(failStatus.code()));
-            boolean done = Long.valueOf(0L).equals(r);
-            if (done) {
+            RollbackOutcome outcome = toOutcome(r);
+            if (outcome == RollbackOutcome.DONE) {
                 metrics.stockRollback(activityId, skuId, "compensate");
             }
             log.info("stage=STOCK_ROLLBACK requestNo={} userId={} qty={} keepBought={} "
-                            + "failStatus={} done={} reason={}",
-                    requestNo, userId, qty, keepBought, failStatus, done, reason);
-            return done;
+                            + "failStatus={} outcome={} reason={}",
+                    requestNo, userId, qty, keepBought, failStatus, outcome, reason);
+            return outcome;
         } catch (Exception e) {
             // 回补失败是库存泄漏（少卖），不是超卖。方向安全，但必须能被告警发现
             metrics.redisUncertain("rollback");
             log.error("stage=STOCK_ROLLBACK requestNo={} result=ERROR 库存暂时泄漏，待对账修正",
                     requestNo, e);
-            return false;
+            return RollbackOutcome.FAILED;
         } finally {
             metrics.luaTimer("rollback", System.nanoTime() - t0);
         }
@@ -173,9 +174,9 @@ public class SeckillExecutor {
     /**
      * 脚本 C：取消回补（RELEASE）。只归还库存，保留用户购买标记（决策 1）。
      *
-     * @return true 表示本次真的回补了；false 表示该订单已回补过
+     * @return 见 {@link RollbackOutcome}
      */
-    public boolean release(long activityId, long skuId, String orderNo, int qty) {
+    public RollbackOutcome release(long activityId, long skuId, String orderNo, int qty) {
         List<String> keys = List.of(
                 RedisKeys.stock(activityId, skuId),
                 RedisKeys.released(activityId, skuId),
@@ -184,20 +185,40 @@ public class SeckillExecutor {
         try {
             Long r = redis.execute(releaseScript, keys, orderNo, String.valueOf(qty),
                     String.valueOf(props.getSeckill().getReleasedTtl().toSeconds()));
-            boolean done = Long.valueOf(0L).equals(r);
-            if (done) {
+            RollbackOutcome outcome = toOutcome(r);
+            if (outcome == RollbackOutcome.DONE) {
                 metrics.stockRollback(activityId, skuId, "release");
             }
-            log.info("stage=STOCK_RELEASE_REDIS orderNo={} qty={} done={}", orderNo, qty, done);
-            return done;
+            log.info("stage=STOCK_RELEASE_REDIS orderNo={} qty={} outcome={}", orderNo, qty, outcome);
+            return outcome;
         } catch (Exception e) {
             metrics.redisUncertain("release");
             log.error("stage=STOCK_RELEASE_REDIS orderNo={} result=ERROR 库存暂时泄漏，待对账修正",
                     orderNo, e);
-            return false;
+            return RollbackOutcome.FAILED;
         } finally {
             metrics.luaTimer("release", System.nanoTime() - t0);
         }
+    }
+
+    /**
+     * 脚本返回码 → 结果。
+     *
+     * <p>{@code 0} 是"本次真的回补了"，{@code 1} 是"幂等命中，无需动作"，
+     * 其余（含 {@code null}）一律当作失败——<b>未知按失败处理</b>：
+     * 多报一次警的代价是一条日志，漏报一次的代价是库存静默少卖。
+     *
+     * <p>包级可见是为了能被单测直接驱动：这条映射是整个告警分级的地基，
+     * 一个方向改错就会把"库存泄漏"降级成"正常的重复投递"。
+     */
+    static RollbackOutcome toOutcome(Long r) {
+        if (Long.valueOf(0L).equals(r)) {
+            return RollbackOutcome.DONE;
+        }
+        if (Long.valueOf(1L).equals(r)) {
+            return RollbackOutcome.ALREADY_DONE;
+        }
+        return RollbackOutcome.FAILED;
     }
 
     /**
@@ -249,17 +270,6 @@ public class SeckillExecutor {
     public Long currentStock(long activityId, long skuId) {
         String v = redis.opsForValue().get(RedisKeys.stock(activityId, skuId));
         return v == null ? null : Long.parseLong(v);
-    }
-
-    /**
-     * 该订单是否已经回补过。
-     *
-     * <p>消费端用它区分"脚本执行失败"与"幂等命中"：脚本 C 对两者都返回非 0，
-     * 分不开的话重复投递会被当成失败无限重试，最后整批进死信。
-     */
-    public boolean isReleased(long activityId, long skuId, String orderNo) {
-        return Boolean.TRUE.equals(redis.opsForSet()
-                .isMember(RedisKeys.released(activityId, skuId), orderNo));
     }
 
     /**

@@ -1,5 +1,6 @@
 package com.fss.biz.consumer;
 
+import com.fss.biz.seckill.core.RollbackOutcome;
 import com.fss.biz.seckill.core.SeckillCompensateService;
 import com.fss.common.error.ErrorCode;
 import com.fss.common.trace.TraceContext;
@@ -30,6 +31,11 @@ import java.nio.charset.StandardCharsets;
  *
  * <p>幂等靠脚本 B 的请求状态机（{@code status ~= 0 → return 1}），
  * 重复投递 10 次 {@code INCRBY} 只执行一次（故障用例 F11）。
+ *
+ * <p><b>重要：当前没有任何代码往这个 Topic 发消息。</b>
+ * 补偿走的是同步直调 + 库存对账兜底（见 README「已知取舍」）。本消费者保留下来
+ * 是为了让 F11 这条演练仍可执行——用 {@code mqadmin sendMessage} 手动重投即可。
+ * 排查问题时不要去找生产端，它不存在。
  */
 @Slf4j
 @Component
@@ -66,9 +72,16 @@ public class StockRollbackListener implements RocketMQListener<MessageExt> {
                     ? ErrorCode.ALREADY_BOUGHT
                     : ErrorCode.SYSTEM_BUSY;
 
-            boolean done = compensateService.rollback(toCreateMessage(msg), ec, msg.getReason());
-            log.info("stage=STOCK_ROLLBACK_MQ requestNo={} done={} reconsume={}",
-                    msg.getRequestNo(), done, ext.getReconsumeTimes());
+            RollbackOutcome outcome = compensateService.rollback(toCreateMessage(msg), ec,
+                    msg.getReason());
+            // FAILED 必须重投：Redis 调用失败时回补到底发生没有是未知的。
+            // 早先这里只看 boolean 的 false，而 false 同时表示"幂等命中"，
+            // 于是回补失败也会走进 markConsumed —— 与下面 catch 里写的"待重试"自相矛盾
+            if (outcome.isFailed()) {
+                throw new IllegalStateException("补偿回补未生效: " + msg.getRequestNo());
+            }
+            log.info("stage=STOCK_ROLLBACK_MQ requestNo={} outcome={} reconsume={}",
+                    msg.getRequestNo(), outcome, ext.getReconsumeTimes());
             markConsumed(ext);
 
         } catch (Exception e) {

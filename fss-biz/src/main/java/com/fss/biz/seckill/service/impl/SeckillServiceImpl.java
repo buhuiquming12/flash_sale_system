@@ -3,6 +3,7 @@ package com.fss.biz.seckill.service.impl;
 import com.alibaba.csp.sentinel.annotation.SentinelResource;
 import com.alibaba.csp.sentinel.slots.block.BlockException;
 import com.fss.biz.mq.ReliableMqProducer;
+import com.fss.biz.seckill.core.RollbackOutcome;
 import com.fss.biz.seckill.core.SeckillCompensateService;
 import com.fss.biz.seckill.core.SeckillExecutor;
 import com.fss.biz.seckill.core.SeckillOutcome;
@@ -24,6 +25,7 @@ import com.fss.domain.mapper.OrderMapper;
 import com.fss.domain.mapper.SeckillRequestMapper;
 import com.fss.domain.message.OrderCreateMessage;
 import com.fss.infra.alarm.AlarmService;
+import com.fss.infra.config.FssProperties;
 import com.fss.infra.config.SentinelConfig;
 import com.fss.infra.degrade.DegradeSwitch;
 import com.fss.infra.metrics.SeckillMetrics;
@@ -75,6 +77,7 @@ public class SeckillServiceImpl implements SeckillService {
     private final DegradeSwitch            degradeSwitch;
     private final SeckillMetrics           metrics;
     private final AlarmService             alarm;
+    private final FssProperties            props;
 
     /**
      * {@code exceptionsToIgnore = BizException.class} 是这段集成里最关键的一行。
@@ -104,8 +107,19 @@ public class SeckillServiceImpl implements SeckillService {
         long activityId = cmd.getActivityId();
         long skuId      = cmd.getSkuId();
 
-        // 2. 令牌校验（若携带）。GETDEL 一次性消费，见 SeckillTokenService
-        if (cmd.getToken() != null && !cmd.getToken().isBlank()) {
+        // 2. 令牌校验。GETDEL 一次性消费，见 SeckillTokenService
+        //
+        //    以前这里是"带了令牌才校验"，于是不传令牌就整段跳过——
+        //    与 SeckillController 里那个固定路径 /api/seckill/do 叠加之后，
+        //    整套令牌设计（一次性、绑定 userId+活动+SKU、必须持有效 offer）
+        //    退化成一次多余的 Redis 往返。现在默认必须携带，
+        //    只有显式打开 allow-tokenless-submit 才放行（压测与演示用）。
+        if (cmd.getToken() == null || cmd.getToken().isBlank()) {
+            if (!props.getSeckill().isAllowTokenlessSubmit()) {
+                throw new BizException(ErrorCode.FORBIDDEN,
+                        "必须携带秒杀令牌，请先调用 /api/seckill/token 获取");
+            }
+        } else {
             tokenService.verifyAndConsume(cmd.getToken(), userId, activityId, skuId);
         }
 
@@ -162,7 +176,16 @@ public class SeckillServiceImpl implements SeckillService {
             // 必须就地回补，否则这一份库存永久泄漏
             log.error("stage=SECKILL_SUBMIT requestNo={} result=MQ_PERSIST_FAILED 立即回补",
                     requestNo, e);
-            compensateService.rollback(msg, ErrorCode.SYSTEM_BUSY, "消息登记失败，已退回");
+            RollbackOutcome rollbackOutcome = compensateService.rollback(msg,
+                    ErrorCode.SYSTEM_BUSY, "消息登记失败，已退回");
+            if (rollbackOutcome.isFailed()) {
+                // 用户拿到的是"系统繁忙"，他会用新的 requestNo 重试；
+                // 而这一份库存没有任何后续机制会归还，只能靠对账
+                log.error("stage=SECKILL_SUBMIT requestNo={} result=ROLLBACK_FAILED 库存泄漏",
+                        requestNo);
+                alarm.p1(AlarmService.Event.REDIS_UNCERTAIN, requestNo,
+                        "消息登记失败后回补失败，库存可能泄漏");
+            }
             metrics.seckillRequest(activityId, skuId, "mq_persist_failed");
             throw new BizException(ErrorCode.SYSTEM_BUSY);
         }

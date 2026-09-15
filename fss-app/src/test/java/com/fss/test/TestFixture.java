@@ -26,11 +26,13 @@ import com.fss.domain.mapper.UserMapper;
 import com.fss.infra.redis.RedisKeys;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
@@ -220,6 +222,27 @@ public class TestFixture {
 
     private long toMillis(LocalDateTime t) {
         return t.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+    }
+
+    /**
+     * Redis 侧的当前时间。
+     *
+     * <p><b>跨进程比较时间窗口时必须用它，不能用 {@code LocalDateTime.now()}。</b>
+     * Lua 的时间校验读的是 Redis 自己的 {@code TIME}，而 Redis 跑在容器里，
+     * 容器时钟与 JVM 时钟可以有秒级偏差——实测这台机器上 Redis 比宿主慢 1.0~1.6 秒
+     * （Docker Desktop 的 VM 时钟会周期性漂移，所以同一个测试昨天绿、今天红）。
+     *
+     * <p>用 JVM 时间写一个"刚刚结束"的窗口、余量又只有一秒时，
+     * 偏差一旦超过余量，窗口在 Redis 看来仍然是开的，测试就会以
+     * "活动已结束却全部下单成功"的形式失败，而问题根本不在被测代码里。
+     */
+    public LocalDateTime redisNow() {
+        Long epochSecond = redis.execute(
+                new DefaultRedisScript<>("return redis.call('TIME')[1]", Long.class), List.of());
+        if (epochSecond == null) {
+            throw new IllegalStateException("读取 Redis TIME 失败");
+        }
+        return LocalDateTime.ofInstant(Instant.ofEpochSecond(epochSecond), ZoneId.systemDefault());
     }
 
     public int availableStock(long activityId, long skuId) {

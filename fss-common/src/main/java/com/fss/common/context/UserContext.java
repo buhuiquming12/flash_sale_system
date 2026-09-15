@@ -12,8 +12,10 @@ import lombok.RequiredArgsConstructor;
  * 而不是从请求体里读——<b>请求体里的 userId 一律不可信</b>。
  *
  * <p>为什么不直接用 Spring Security 的 {@code SecurityContextHolder}：
- * 那会让 fss-biz 依赖 spring-security-core。认证过滤器会同时写入两者，
- * Security 负责 URL/方法级授权规则，业务层只从这里取身份。
+ * 那会让 fss-biz 依赖 spring-security-core。本项目未引入
+ * spring-boot-starter-security，URL 与角色级授权同样由自研过滤器承担——
+ * {@code JwtAuthFilter} 校验 token 并写入身份，{@code AdminAuthFilter}
+ * 按 {@code /api/admin/} 前缀校验管理员角色——业务层只从这里取身份。
  *
  * <p>线程池场景（异步任务、定时任务）不会有用户上下文，此时 {@link #userId()} 抛
  * {@code UNAUTHORIZED}，需要 userId 的逻辑必须由调用方显式传入。
