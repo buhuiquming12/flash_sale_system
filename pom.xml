@@ -261,6 +261,14 @@
                     <argLine>@{failsafeArgLine} -Dfile.encoding=UTF-8</argLine>
                     <groups>integration</groups>
                     <!--
+                        RocketMQ 5.3.0 的 ServiceThread.shutdown() 最长会 join 90 秒。
+                        Linux runner 上偶尔会在 NettyRemotingClient 关闭时走满这段等待，
+                        而 Failsafe 默认只给 fork JVM 30 秒退出，于是 140 个用例全部通过后
+                        仍会被强杀并记成 result=255。这里给依赖自身的关闭上限留出余量；
+                        它只约束测试执行完成后的 JVM 退出，不会放宽任何用例超时。
+                    -->
+                    <forkedProcessExitTimeoutInSeconds>120</forkedProcessExitTimeoutInSeconds>
+                    <!--
                         仓库里没有 *IT 命名的类，failsafe 默认的 includes
                         （**/IT*.java、**/*IT.java、**/*ITCase.java）一个也匹配不上，
                         表现是"集成测试一个没跑，构建还是绿的"。改成与 surefire 同样的
