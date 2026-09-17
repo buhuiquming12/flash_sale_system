@@ -1,15 +1,21 @@
 package com.fss.metrics;
 
+import com.fss.biz.consumer.OrderCreateListener;
 import com.fss.biz.seckill.model.SeckillSubmitVO;
 import com.fss.common.error.BizException;
+import com.fss.common.util.JsonUtil;
+import com.fss.domain.message.OrderCreateMessage;
 import com.fss.infra.metrics.SeckillMetrics;
 import com.fss.test.IntegrationTestBase;
 import com.fss.test.TestFixture;
 import io.micrometer.core.instrument.MeterRegistry;
+import org.apache.rocketmq.common.message.MessageExt;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Set;
 
@@ -37,9 +43,10 @@ class MetricsTest extends IntegrationTestBase {
             Set.of("userId", "user_id", "requestNo", "request_no",
                     "orderNo", "order_no", "payNo", "pay_no", "traceId", "trace_id");
 
-    @Autowired SeckillMetrics metrics;
-    @Autowired MeterRegistry  registry;
-    @Autowired TestFixture    fixture;
+    @Autowired SeckillMetrics      metrics;
+    @Autowired MeterRegistry       registry;
+    @Autowired TestFixture         fixture;
+    @Autowired OrderCreateListener orderCreateListener;
 
     @Test
     @DisplayName("M1 秒杀主链路的关键指标都在")
@@ -62,20 +69,25 @@ class MetricsTest extends IntegrationTestBase {
                 "activity", String.valueOf(a), "sku", String.valueOf(s),
                 "result", "already_bought")).isEqualTo(1.0);
         assertThat(metrics.counterValue("fss_seckill_qualified_total", tags)).isEqualTo(1.0);
-        // ⚠ 这里**不按 (activity, sku) 断言具体值**，而只断言指标已注册。
-        //
-        // 原因：整套跑时它稳定失败（4 轮里 3 轮），而单跑从不失败。
-        // 加了 2 秒轮询也没用 —— 失败信息显示该活动的序列**压根没被创建**
-        // （现有序列是别的活动），说明这一单的订单是 duplicate=true 建出来的：
-        // 消息被消费了两次，第一次建单、第二次 L1 幂等命中，
-        // 而埋点只在 !duplicate 时执行。至于为什么在整套跑时必然重投一次，
-        // 那与共享 Spring 上下文中多个用例并发投递、消费端 12 线程抢同一批消息有关，
-        // 已超出"指标是否埋对"这个用例的职责范围。
-        //
-        // 这个用例的目的是**指标存在且形状正确**（M1 的标题就是"关键指标都在"），
-        // 具体计数的正确性由 MetricsExportTest（导出文本）和
-        // ReconcileTest（业务口径）覆盖。按序列存在性断言既达到目的，
-        // 又不依赖跨线程的消费时序。
+        // 全量测试会缓存多个 Spring 上下文，它们使用同一消费组，等价于多个应用实例。
+        // 经 broker 投递的消息可能被另一个上下文消费，不能据此断言当前实例的 Registry。
+        // 直接让当前上下文的真实 Listener 处理一条独立消息，确定性验证消费埋点调用链。
+        String requestNo = "R_METRICS_" + System.nanoTime();
+        OrderCreateMessage message = OrderCreateMessage.builder()
+                .requestNo(requestNo)
+                .userId(fixture.createUser())
+                .activityId(a)
+                .skuId(s)
+                .quantity(1)
+                .requestTime(LocalDateTime.now())
+                .traceId("trace-metrics")
+                .version(OrderCreateMessage.CURRENT_VERSION)
+                .build();
+        MessageExt ext = new MessageExt();
+        ext.setKeys(requestNo);
+        ext.setBody(JsonUtil.toJson(message).getBytes(StandardCharsets.UTF_8));
+        orderCreateListener.onMessage(ext);
+
         assertThat(registry.find("fss_order_create_total").counters())
                 .as("订单创建计数器必须已注册。它是 OrderExceedsTotalStock "
                         + "这条 P1 告警规则的左侧，缺了规则永远不触发")
