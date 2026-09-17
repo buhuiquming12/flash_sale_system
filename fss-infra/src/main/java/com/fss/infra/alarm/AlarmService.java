@@ -103,6 +103,8 @@ public class AlarmService {
         public static final String MQ_DLQ              = "MQ_DLQ";
         /** 消息积压超阈值 */
         public static final String MQ_BACKLOG          = "MQ_BACKLOG";
+        /** 本地消息表显示已发送，但 broker 按 key 查不到消息 */
+        public static final String MQ_MESSAGE_LOST     = "MQ_MESSAGE_LOST";
         /** 自动降级等级变化 */
         public static final String DEGRADE_LEVEL       = "DEGRADE_LEVEL_CHANGED";
         /** Redis 调用结果不确定 */

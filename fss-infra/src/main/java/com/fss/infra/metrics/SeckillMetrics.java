@@ -150,6 +150,18 @@ public class SeckillMetrics {
                 .register(registry).increment();
     }
 
+    /** 本地消息登记到首次确认消费的端到端时延。 */
+    public void mqDeliveryLatency(String topic, long nanos) {
+        Timer.builder("fss_mq_delivery_seconds")
+                .tag("topic", topic)
+                .description("本地消息登记到消费确认的端到端时延")
+                .publishPercentileHistogram()
+                .minimumExpectedValue(Duration.ofMillis(1))
+                .maximumExpectedValue(Duration.ofHours(1))
+                .register(registry)
+                .record(nanos, TimeUnit.NANOSECONDS);
+    }
+
     /** Redis 调用结果不确定。这条曲线抬头意味着 Redis 在超时边缘 */
     public void redisUncertain(String stage) {
         Counter.builder("fss_redis_uncertain_total").tag("stage", stage)

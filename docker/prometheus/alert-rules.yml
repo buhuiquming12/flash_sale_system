@@ -75,12 +75,12 @@ groups:
   - name: fss-warning
     rules:
       - alert: MqBacklogHigh
-        expr: fss_mq_backlog{topic="FSS_ORDER_CREATE"} > 20000
+        expr: fss_mq_backlog{topic=~"FSS_(ORDER_CREATE|ORDER_CLOSE|STOCK_RELEASE|STOCK_ROLLBACK)"} > 20000
         for: 2m
         labels: { severity: P2 }
         annotations:
-          summary: "订单创建消息积压 {{ $value }}"
-          description: "自动降级阈值是 50000，这条是提前预警"
+          summary: "消息积压 topic={{ $labels.topic }} group={{ $labels.group }} value={{ $value }}"
+          description: "ORDER_CREATE 自动降级阈值是 50000；其余链路同样必须提前预警"
 
       # 分子只算 result="error" 与 uncertain 这两种<b>系统</b>失败。
       # 绝不能把 stock_not_enough / already_bought 算进去：活动一售罄

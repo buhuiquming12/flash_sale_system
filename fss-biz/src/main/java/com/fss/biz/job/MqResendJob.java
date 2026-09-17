@@ -1,6 +1,7 @@
 package com.fss.biz.job;
 
 import com.fss.biz.mq.ReliableMqProducer;
+import com.fss.biz.mq.StockRollbackFallback;
 import com.fss.biz.seckill.core.RollbackOutcome;
 import com.fss.biz.seckill.core.SeckillCompensateService;
 import com.fss.common.error.ErrorCode;
@@ -60,6 +61,7 @@ public class MqResendJob {
     private final SeckillMetrics           metrics;
     private final AlarmService             alarm;
     private final FssProperties            props;
+    private final StockRollbackFallback    rollbackFallback;
 
     @Scheduled(fixedDelayString = "${fss.job.mq-resend-delay-ms:30000}")
     @DistributedLock(key = "mq-resend", leaseSeconds = 120)
@@ -128,6 +130,8 @@ public class MqResendJob {
             RollbackOutcome outcome = compensateService.rollback(msg, ErrorCode.SYSTEM_BUSY,
                     "订单消息投递失败，已退回");
             if (outcome.isFailed()) {
+                rollbackFallback.publish(msg, ErrorCode.SYSTEM_BUSY,
+                        "订单创建消息投递放弃后的同步回补失败");
                 // 回补本身失败了：库存还占着，而这条消息已经不会再重发。
                 // 这是设计里唯一一处"必须 P1"的场景，之前写在一个永远不会进入的
                 // catch 块里（rollback 把异常吞了），实际只会走下面那条 P2

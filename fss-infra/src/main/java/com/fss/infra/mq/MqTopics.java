@@ -21,26 +21,17 @@ public final class MqTopics {
     public static final String ORDER_CLOSE    = "FSS_ORDER_CLOSE";
     public static final String STOCK_RELEASE  = "FSS_STOCK_RELEASE";
 
-    /**
-     * 补偿回补主题。
-     *
-     * <p><b>代码里没有生产者。</b> 补偿目前走的是同步直调
-     * （{@code SeckillCompensateService#rollback}）+ 库存对账兜底，
-     * 没有任何路径往这个主题发消息（见 README「已知取舍」一节）。
-     * 它保留下来是因为消费端 {@code StockRollbackListener} 仍然有效，
-     * 可以由运维用 {@code mqadmin sendMessage} 手动重投，
-     * 用来演练故障用例 F11（重复投递 10 次，库存只 +1）。
-     *
-     * <p>所以：不要以为发了 ORDER_CREATE 之外的消息就会自动回补；
-     * 也不要因为"订阅了却一直没消息"去查生产端——它本来就没有。
-     */
+    /** 补偿回补主题：同步回补返回 FAILED 后才进入该可靠重试链路。 */
     public static final String STOCK_ROLLBACK = "FSS_STOCK_ROLLBACK";
 
     public static final String GID_ORDER_CREATE   = "GID_FSS_ORDER_CREATE";
     public static final String GID_ORDER_CLOSE    = "GID_FSS_ORDER_CLOSE";
     public static final String GID_STOCK_RELEASE  = "GID_FSS_STOCK_RELEASE";
     public static final String GID_STOCK_ROLLBACK = "GID_FSS_STOCK_ROLLBACK";
-    public static final String GID_DLQ_HANDLER    = "GID_FSS_DLQ_HANDLER";
+    public static final String GID_DLQ_ORDER_CREATE_HANDLER   = "GID_FSS_DLQ_ORDER_CREATE_HANDLER";
+    public static final String GID_DLQ_ORDER_CLOSE_HANDLER    = "GID_FSS_DLQ_ORDER_CLOSE_HANDLER";
+    public static final String GID_DLQ_STOCK_RELEASE_HANDLER  = "GID_FSS_DLQ_STOCK_RELEASE_HANDLER";
+    public static final String GID_DLQ_STOCK_ROLLBACK_HANDLER = "GID_FSS_DLQ_STOCK_ROLLBACK_HANDLER";
 
     /**
      * 死信 Topic 前缀。RocketMQ 把某个消费组重试耗尽的消息投到 {@code %DLQ%<group>}，
@@ -49,6 +40,9 @@ public final class MqTopics {
     public static final String DLQ_PREFIX = "%DLQ%";
 
     public static final String DLQ_ORDER_CREATE = DLQ_PREFIX + GID_ORDER_CREATE;
+    public static final String DLQ_ORDER_CLOSE = DLQ_PREFIX + GID_ORDER_CLOSE;
+    public static final String DLQ_STOCK_RELEASE = DLQ_PREFIX + GID_STOCK_RELEASE;
+    public static final String DLQ_STOCK_ROLLBACK = DLQ_PREFIX + GID_STOCK_ROLLBACK;
 
     private MqTopics() {
     }

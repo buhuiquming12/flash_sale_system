@@ -12,6 +12,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.apache.rocketmq.client.producer.SendCallback;
+import org.apache.rocketmq.client.producer.SendResult;
+import org.apache.rocketmq.client.producer.SendStatus;
+import com.fss.infra.mq.MqTopics;
 
 import java.time.LocalDateTime;
 
@@ -103,11 +107,58 @@ public class ReliableMqProducer {
     }
 
     private void trySend(MqMessage rec) {
+        if (MqTopics.ORDER_CREATE.equals(rec.getTopic()) && rec.getDeliverTime() == null) {
+            trySendOrderCreateAsync(rec);
+            return;
+        }
         try {
             doSend(rec);
         } catch (Exception e) {
             log.warn("stage=MQ_SEND msgId={} bizKey={} topic={} status=FAIL 转由重发任务处理",
                     rec.getMsgId(), rec.getBizKey(), rec.getTopic(), e);
+            markRetryQuietly(rec, e);
+        }
+    }
+
+    /** 请求线程只负责 insert + 发起异步发送，成功/失败都在回调里收口。 */
+    private void trySendOrderCreateAsync(MqMessage rec) {
+        try {
+            sender.sendAsync(rec.getTopic(), rec.getBizKey(), rec.getBody(), new SendCallback() {
+                @Override
+                public void onSuccess(SendResult result) {
+                    try {
+                        if (result == null || result.getSendStatus() != SendStatus.SEND_OK) {
+                            markRetryQuietly(rec, new IllegalStateException("发送状态异常: "
+                                    + (result == null ? "null" : result.getSendStatus())));
+                            return;
+                        }
+                        mapper.markSent(rec.getMsgId());
+                        log.info("stage=MQ_SEND_ASYNC msgId={} bizKey={} topic={} status=OK",
+                                rec.getMsgId(), rec.getBizKey(), rec.getTopic());
+                    } catch (Exception e) {
+                        // 回调线程绝不抛；markSent 失败会保留待发送态，由重发任务幂等补发。
+                        log.warn("stage=MQ_SEND_ASYNC msgId={} status=CALLBACK_FAIL 转由重发任务处理",
+                                rec.getMsgId(), e);
+                        markRetryQuietly(rec, e);
+                    }
+                }
+
+                @Override
+                public void onException(Throwable cause) {
+                    try {
+                        log.warn("stage=MQ_SEND_ASYNC msgId={} bizKey={} topic={} status=FAIL 转由重发任务处理",
+                                rec.getMsgId(), rec.getBizKey(), rec.getTopic(), cause);
+                        markRetryQuietly(rec, cause);
+                    } catch (Exception ignored) {
+                        log.error("stage=MQ_SEND_ASYNC msgId={} status=CALLBACK_RECORD_FAIL",
+                                rec.getMsgId(), ignored);
+                    }
+                }
+            });
+        } catch (Exception e) {
+            // asyncSend 仍可能在“提交异步请求”阶段同步失败。
+            log.warn("stage=MQ_SEND_ASYNC msgId={} status=SUBMIT_FAIL 转由重发任务处理",
+                    rec.getMsgId(), e);
             markRetryQuietly(rec, e);
         }
     }
@@ -119,7 +170,7 @@ public class ReliableMqProducer {
      * 这一步本身失败不能再抛：连不上 DB 的话上一步的 insert 就已经失败了，
      * 走不到这里；能走到这里说明是发送侧的问题，不该被记账失败掩盖成另一个异常。
      */
-    private void markRetryQuietly(MqMessage rec, Exception cause) {
+    private void markRetryQuietly(MqMessage rec, Throwable cause) {
         try {
             mapper.markRetry(rec.getMsgId(), FIRST_BACKOFF_SECONDS, truncate(cause.getMessage()));
         } catch (Exception ignored) {

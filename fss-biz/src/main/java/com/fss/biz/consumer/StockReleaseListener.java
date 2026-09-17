@@ -1,10 +1,10 @@
 package com.fss.biz.consumer;
 
 import com.fss.biz.seckill.core.RollbackOutcome;
+import com.fss.biz.mq.MqConsumeRecorder;
 import com.fss.biz.seckill.core.SeckillExecutor;
 import com.fss.common.trace.TraceContext;
 import com.fss.common.util.JsonUtil;
-import com.fss.domain.mapper.MqMessageMapper;
 import com.fss.domain.message.StockReleaseMessage;
 import com.fss.infra.mq.MqTopics;
 import lombok.RequiredArgsConstructor;
@@ -51,7 +51,7 @@ import java.nio.charset.StandardCharsets;
 public class StockReleaseListener implements RocketMQListener<MessageExt> {
 
     private final SeckillExecutor  executor;
-    private final MqMessageMapper  mqMapper;
+    private final MqConsumeRecorder consumeRecorder;
 
     @Override
     public void onMessage(MessageExt ext) {
@@ -67,6 +67,11 @@ public class StockReleaseListener implements RocketMQListener<MessageExt> {
 
         TraceContext.set(msg.getTraceId());
         try {
+            if (msg.getVersion() == null || msg.getVersion() > StockReleaseMessage.CURRENT_VERSION) {
+                log.error("stage=STOCK_RELEASE_MQ orderNo={} result=UNKNOWN_VERSION version={} 进死信",
+                        msg.getOrderNo(), msg.getVersion());
+                throw new IllegalStateException("未知消息版本: " + msg.getVersion());
+            }
             RollbackOutcome outcome = executor.release(msg.getActivityId(), msg.getSkuId(),
                     msg.getOrderNo(), msg.getQuantity());
             // ALREADY_DONE 是脚本 C 的幂等命中（正常的重复投递），必须 ACK；
@@ -94,7 +99,7 @@ public class StockReleaseListener implements RocketMQListener<MessageExt> {
 
     private void markConsumed(MessageExt ext) {
         try {
-            mqMapper.markConsumedByBizKey(ext.getKeys(), MqTopics.STOCK_RELEASE);
+            consumeRecorder.consumed(ext.getKeys(), MqTopics.STOCK_RELEASE);
         } catch (Exception e) {
             log.debug("标记消息已消费失败 keys={}", ext.getKeys(), e);
         }

@@ -147,7 +147,7 @@
       "type": "timeseries",
       "title": "Lua 脚本耗时 P50 / P95 / P99",
       "description": "Lua 是整个系统唯一的串行瓶颈（Redis 单线程执行脚本），它的 P99 直接决定秒杀接口的 P99。接口变慢时这条曲线能立刻回答「是 Redis 慢了还是应用侧慢了」。",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
       "targets": [
         {
           "expr": "histogram_quantile(0.5, sum by (le, script) (rate(fss_lua_execution_seconds_bucket[5m])))",
@@ -167,11 +167,22 @@
     {
       "type": "timeseries",
       "title": "HTTP 接口 P99",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
       "targets": [{
         "expr": "histogram_quantile(0.99, sum by (le, uri) (rate(http_server_requests_seconds_bucket{uri=~\"/api/seckill.*\"}[5m])))",
         "legendFormat": "{{uri}}"
       }],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "消息登记→消费 P95 / P99",
+      "description": "覆盖本地消息表登记、broker 排队与消费者处理，是四条消息链路的真实端到端时延。",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(fss_mq_delivery_seconds_bucket[5m])))", "legendFormat": "P95 {{topic}}" },
+        { "expr": "histogram_quantile(0.99, sum by (le, topic) (rate(fss_mq_delivery_seconds_bucket[5m])))", "legendFormat": "P99 {{topic}}" }
+      ],
       "fieldConfig": { "defaults": { "unit": "s" } }
     },
     {

@@ -1,0 +1,14 @@
+# 演示环境凭证。生产部署必须替换本文件，并通过 FSS_MQ_ACCESS_KEY / SECRET_KEY
+# 向应用注入同一组最小权限账号；不要把这里的默认值带到生产。
+globalWhiteRemoteAddresses:
+accounts:
+  - accessKey: FssApplicationAccessKey
+    secretKey: FssApplicationSecretKeyChangeMe
+    admin: false
+    defaultTopicPerm: PUB|SUB
+    defaultGroupPerm: SUB
+  - accessKey: FssAdminAccessKey
+    secretKey: FssAdminSecretKeyChangeMeNow
+    admin: true
+    defaultTopicPerm: PUB|SUB
+    defaultGroupPerm: SUB

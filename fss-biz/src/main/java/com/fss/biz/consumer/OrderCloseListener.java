@@ -1,10 +1,10 @@
 package com.fss.biz.consumer;
 
 import com.fss.biz.order.service.OrderService;
+import com.fss.biz.mq.MqConsumeRecorder;
 import com.fss.common.trace.TraceContext;
 import com.fss.common.util.JsonUtil;
 import com.fss.domain.entity.Order;
-import com.fss.domain.mapper.MqMessageMapper;
 import com.fss.domain.mapper.OrderMapper;
 import com.fss.domain.message.OrderCloseMessage;
 import com.fss.infra.mq.MqTopics;
@@ -49,7 +49,7 @@ public class OrderCloseListener implements RocketMQListener<MessageExt> {
 
     private final OrderService    orderService;
     private final OrderMapper     orderMapper;
-    private final MqMessageMapper mqMapper;
+    private final MqConsumeRecorder consumeRecorder;
 
     @Override
     public void onMessage(MessageExt ext) {
@@ -65,6 +65,11 @@ public class OrderCloseListener implements RocketMQListener<MessageExt> {
 
         TraceContext.set(msg.getTraceId());
         try {
+            if (msg.getVersion() == null || msg.getVersion() > OrderCloseMessage.CURRENT_VERSION) {
+                log.error("stage=ORDER_CLOSE orderNo={} result=UNKNOWN_VERSION version={} 进死信",
+                        msg.getOrderNo(), msg.getVersion());
+                throw new IllegalStateException("未知消息版本: " + msg.getVersion());
+            }
             Order order = orderMapper.selectByOrderNo(msg.getOrderNo());
             if (order == null) {
                 // 订单不存在：消息比订单事务的提交更早到达是不可能的
@@ -110,7 +115,7 @@ public class OrderCloseListener implements RocketMQListener<MessageExt> {
 
     private void markConsumed(MessageExt ext) {
         try {
-            mqMapper.markConsumedByBizKey(ext.getKeys(), MqTopics.ORDER_CLOSE);
+            consumeRecorder.consumed(ext.getKeys(), MqTopics.ORDER_CLOSE);
         } catch (Exception e) {
             log.debug("标记消息已消费失败 keys={}", ext.getKeys(), e);
         }

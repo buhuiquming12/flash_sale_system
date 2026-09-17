@@ -84,6 +84,7 @@ class MetricsExportTest {
         metrics.mqResend("FSS_ORDER_CREATE");
         metrics.mqGiveUp("FSS_ORDER_CREATE");
         metrics.dlq("FSS_ORDER_CREATE");
+        metrics.mqDeliveryLatency("FSS_ORDER_CREATE", TimeUnit.MILLISECONDS.toNanos(25));
         metrics.redisUncertain("seckill");
         metrics.jobError("reconcile-stock");
         metrics.luaTimer("seckill", TimeUnit.MILLISECONDS.toNanos(3));

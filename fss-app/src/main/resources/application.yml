@@ -76,16 +76,19 @@ rocketmq:
   name-server: ${FSS_MQ_NAMESRV:127.0.0.1:9876}
   producer:
     group: PID_FSS_PRODUCER
-    # 与 fss.mq.send-timeout 保持一致。给短是因为秒杀链路上的发送在请求线程里，
-    # 超时给长了 Tomcat 线程会堆在等 broker 上——和 Redis 超时一样的道理
+    access-key: ${FSS_MQ_ACCESS_KEY:FssApplicationAccessKey}
+    secret-key: ${FSS_MQ_SECRET_KEY:FssApplicationSecretKeyChangeMe}
+    # 与 fss.mq.send-timeout 保持一致。ORDER_CREATE 首发已改为 asyncSend；
+    # 该超时仍约束异步提交、重发任务和定时消息的同步发送。
     send-message-timeout: 2000
     # 发送失败时客户端自己重试的次数。给 1 而不是默认的 2：
-    # 真正的重试兜底是本地消息表 + 重发任务，客户端在请求线程里多重试一次
-    # 只会让接口 RT 翻倍。快速失败交给重发任务更好
+    # 真正的重试兜底是本地消息表 + 重发任务，客户端内重试只会拖长回调完成时间。
     retry-times-when-send-failed: 1
     # 4MB 以下不压缩。消息体只有几个 ID，压缩纯属浪费 CPU
     compress-message-body-threshold: 4096
   consumer:
+    access-key: ${FSS_MQ_ACCESS_KEY:FssApplicationAccessKey}
+    secret-key: ${FSS_MQ_SECRET_KEY:FssApplicationSecretKeyChangeMe}
     # 一次 pull 拉多少条。与 consumeThreadNumber 配合决定单实例吞吐
     pull-batch-size: 16
 
@@ -178,6 +181,10 @@ fss:
       stock-rollback: GID_FSS_STOCK_ROLLBACK
     send-timeout: 2000
     max-resend: 5
+    sent-recheck-after: 10m
+    terminal-retention: 7d
+    access-key: ${FSS_MQ_ACCESS_KEY:FssApplicationAccessKey}
+    secret-key: ${FSS_MQ_SECRET_KEY:FssApplicationSecretKeyChangeMe}
     # 启动 DefaultMQAdminExt 采集积压量。它是一个额外的 MQ 客户端，
     # broker 不可达时会每轮刷一条连接失败日志，所以默认值是 false，这里显式打开
     backlog-monitor-enabled: true
@@ -217,6 +224,8 @@ fss:
     # 开太大反而抢连接。4 是折中，见 FssProperties.Job 的注释
     warmup-concurrency: 4
     mq-resend-delay-ms: 30000
+    mq-sent-recheck-delay-ms: 60000
+    mq-cleanup-cron: "0 20 3 * * ?"
     # 三类对账的频率不同是刻意的：资格对账最频繁（用户正在等），
     # 库存对账最贵（SCAN + 多次 DB），支付对账最不急但最严重。见 ReconcileJob 注释
     reconcile-qualification-cron: "0 * * * * ?"

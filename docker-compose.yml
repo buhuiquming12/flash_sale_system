@@ -285,12 +285,23 @@ services:
     ports:
       - "9876:9876"
 
+  rocketmq-namesrv-b:
+    image: apache/rocketmq:5.3.0
+    container_name: fss-rmq-namesrv-b
+    profiles: ["phase3", "all"]
+    command: sh mqnamesrv
+    environment:
+      JAVA_OPT_EXT: "-Xms256m -Xmx256m -Xmn128m"
+    ports:
+      - "9886:9876"
+
   rocketmq-broker:
     image: apache/rocketmq:5.3.0
     container_name: fss-rmq-broker
     profiles: ["phase3", "all"]
     depends_on:
       - rocketmq-namesrv
+      - rocketmq-namesrv-b
     environment:
       JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m"
       # broker 注册到 namesrv 的自身地址，客户端拿到它之后直连。
@@ -299,6 +310,7 @@ services:
       FSS_BROKER_IP: "${FSS_BROKER_IP:-rocketmq-broker}"
     volumes:
       - ./docker/rocketmq/broker.conf:/home/rocketmq/conf/broker.conf:ro
+      - ./docker/rocketmq/plain_acl.yml:/home/rocketmq/conf/plain_acl.yml:ro
     # broker.conf 是只读挂载的模板，启动时把 brokerIP1 那一行替换掉再用。
     # 为两种部署形态各留一份 broker.conf 会漂移，而漂移的那一行
     # （恰好是决定客户端能不能连上的那一行）只会在切换形态时暴露。
@@ -320,6 +332,61 @@ services:
       - "10911:10911"
       - "10912:10912"
 
+  rocketmq-broker-b:
+    image: apache/rocketmq:5.3.0
+    container_name: fss-rmq-broker-b
+    profiles: ["phase3", "all"]
+    depends_on:
+      - rocketmq-namesrv
+      - rocketmq-namesrv-b
+    environment:
+      JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m"
+      FSS_BROKER_IP: "${FSS_BROKER_B_IP:-rocketmq-broker-b}"
+    volumes:
+      - ./docker/rocketmq/broker-b.conf:/home/rocketmq/conf/broker.conf:ro
+      - ./docker/rocketmq/plain_acl.yml:/home/rocketmq/conf/plain_acl.yml:ro
+    command: sh -c 'sed "s|^brokerIP1 *=.*|brokerIP1 = $$FSS_BROKER_IP|" /home/rocketmq/conf/broker.conf > /tmp/broker.conf && exec sh mqbroker -c /tmp/broker.conf'
+    ports:
+      - "11009:11009"
+      - "11011:11011"
+      - "11012:11012"
+
+  # 两个 SYNC_MASTER 各配一个同 brokerName、brokerId=1 的 Slave。
+  # 没有 Slave 时 SYNC_MASTER 会返回 SLAVE_NOT_AVAILABLE，应用会把发送判为失败。
+  rocketmq-broker-a-slave:
+    image: apache/rocketmq:5.3.0
+    container_name: fss-rmq-broker-a-slave
+    profiles: ["phase3", "all"]
+    depends_on: [rocketmq-broker]
+    environment:
+      JAVA_OPT_EXT: "-Xms256m -Xmx256m -Xmn128m"
+      FSS_BROKER_IP: "${FSS_BROKER_A_SLAVE_IP:-rocketmq-broker-a-slave}"
+    volumes:
+      - ./docker/rocketmq/broker-a-slave.conf:/home/rocketmq/conf/broker.conf:ro
+      - ./docker/rocketmq/plain_acl.yml:/home/rocketmq/conf/plain_acl.yml:ro
+    command: sh -c 'sed "s|^brokerIP1 *=.*|brokerIP1 = $$FSS_BROKER_IP|" /home/rocketmq/conf/broker.conf > /tmp/broker.conf && exec sh mqbroker -c /tmp/broker.conf'
+    ports:
+      - "10929:10929"
+      - "10931:10931"
+      - "10932:10932"
+
+  rocketmq-broker-b-slave:
+    image: apache/rocketmq:5.3.0
+    container_name: fss-rmq-broker-b-slave
+    profiles: ["phase3", "all"]
+    depends_on: [rocketmq-broker-b]
+    environment:
+      JAVA_OPT_EXT: "-Xms256m -Xmx256m -Xmn128m"
+      FSS_BROKER_IP: "${FSS_BROKER_B_SLAVE_IP:-rocketmq-broker-b-slave}"
+    volumes:
+      - ./docker/rocketmq/broker-b-slave.conf:/home/rocketmq/conf/broker.conf:ro
+      - ./docker/rocketmq/plain_acl.yml:/home/rocketmq/conf/plain_acl.yml:ro
+    command: sh -c 'sed "s|^brokerIP1 *=.*|brokerIP1 = $$FSS_BROKER_IP|" /home/rocketmq/conf/broker.conf > /tmp/broker.conf && exec sh mqbroker -c /tmp/broker.conf'
+    ports:
+      - "11029:11029"
+      - "11031:11031"
+      - "11032:11032"
+
   # 建 Topic。broker.conf 里 autoCreateTopicEnable = false，不建就发不出消息，
   # 而症状是发送报 "topic not exist" 或消息进了默认 8 队列的自动 Topic。
   #
@@ -333,9 +400,14 @@ services:
     profiles: ["phase3", "all"]
     depends_on:
       - rocketmq-broker
+      - rocketmq-broker-b
+      - rocketmq-broker-a-slave
+      - rocketmq-broker-b-slave
     environment:
       JAVA_OPT_EXT: "-Xms64m -Xmx256m -Xmn64m"
-      NAMESRV: rocketmq-namesrv:9876
+      NAMESRV: "rocketmq-namesrv:9876;rocketmq-namesrv-b:9876"
+      ACCESS_KEY: FssAdminAccessKey
+      SECRET_KEY: FssAdminSecretKeyChangeMeNow
     volumes:
       - ./docker/rocketmq/init-topics.sh:/init-topics.sh:ro
     restart: "no"
@@ -437,7 +509,9 @@ services:
       SPRING_DATASOURCE_PASSWORD: root
       FSS_REDIS_HOST: redis
       FSS_REDIS_PORT: 6379
-      FSS_MQ_NAMESRV: rocketmq-namesrv:9876
+      FSS_MQ_NAMESRV: "rocketmq-namesrv:9876;rocketmq-namesrv-b:9876"
+      FSS_MQ_ACCESS_KEY: FssApplicationAccessKey
+      FSS_MQ_SECRET_KEY: FssApplicationSecretKeyChangeMe
       # 演示环境用默认弱密钥。生产必须由外部注入，见 application.yml 的注释
       FSS_JWT_SECRET: fss-local-dev-only-secret-change-me-in-prod
       FSS_PAY_SECRET: fss-mock-pay-secret-change-me-in-prod

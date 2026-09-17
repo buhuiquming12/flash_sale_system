@@ -121,6 +121,12 @@ public class FssProperties {
          * 联调与生产显式打开。
          */
         private boolean backlogMonitorEnabled = false;
+        /** SENT 超过该窗口仍未确认消费，才向 broker 核对，避开正常积压。 */
+        private Duration sentRecheckAfter = Duration.ofMinutes(10);
+        /** 已消费/发送失败记录的保留期。 */
+        private Duration terminalRetention = Duration.ofDays(7);
+        private String accessKey = "FssApplicationAccessKey";
+        private String secretKey = "FssApplicationSecretKeyChangeMe";
 
         @Data
         public static class Topic {
@@ -250,6 +256,10 @@ public class FssProperties {
          * 两轮会重叠——虽然分布式锁挡得住，但那是靠锁掩盖了配置问题。
          */
         private long   mqResendDelayMs   = 30_000;
+        /** 消息终态清理，每天凌晨 03:20。 */
+        private String mqCleanupCron      = "0 20 3 * * ?";
+        /** 已发送消息丢失复核。 */
+        private long   mqSentRecheckDelayMs = 60_000;
         /** 资格对账 */
         private String reconcileQualificationCron = "0 * * * * ?";
         /** 库存对账 */

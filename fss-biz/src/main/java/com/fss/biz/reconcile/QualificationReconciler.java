@@ -1,6 +1,7 @@
 package com.fss.biz.reconcile;
 
 import com.fss.biz.mq.ReliableMqProducer;
+import com.fss.biz.mq.StockRollbackFallback;
 import com.fss.biz.seckill.core.RollbackOutcome;
 import com.fss.biz.seckill.core.SeckillCompensateService;
 import com.fss.biz.seckill.core.SeckillExecutor;
@@ -77,6 +78,7 @@ public class QualificationReconciler {
     private final SeckillExecutor          executor;
     private final SeckillCompensateService compensateService;
     private final ReliableMqProducer       producer;
+    private final StockRollbackFallback    rollbackFallback;
     private final StringRedisTemplate      redis;
     private final ReconcileRecorder        recorder;
     private final SeckillMetrics           metrics;
@@ -229,6 +231,9 @@ public class QualificationReconciler {
         // 无法区分，于是一次正常的重复回补会被记成 NEED_MANUAL，
         // 在工单列表里造出一条根本不存在的待办
         boolean fixed = !outcome.isFailed();
+        if (!fixed) {
+            rollbackFallback.publish(msg, ErrorCode.SYSTEM_BUSY, reason);
+        }
         recorder.record(ReconcileTaskType.QUALIFICATION, requestNo, activityId, skuId,
                 detail("ORPHAN_ROLLBACK", requestNo, null, reason),
                 fixed ? ReconcileTaskStatus.AUTO_FIXED : ReconcileTaskStatus.NEED_MANUAL,

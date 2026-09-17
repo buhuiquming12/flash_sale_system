@@ -230,7 +230,8 @@ CREATE TABLE IF NOT EXISTS t_mq_message (
     update_time   DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     PRIMARY KEY (id),
     UNIQUE KEY uk_msg_id (msg_id),
-    KEY idx_status_retry (status, next_retry_at)
+    KEY idx_status_retry (status, next_retry_at),
+    KEY idx_status_update (status, update_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='本地消息表';
 
 -- ---------------------------------------------------------------------
@@ -260,7 +261,7 @@ CREATE TABLE IF NOT EXISTS t_stock_log (
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS t_reconcile_task (
     id            BIGINT       NOT NULL AUTO_INCREMENT,
-    task_type     TINYINT      NOT NULL COMMENT '1=资格对账 2=库存对账 3=支付对账',
+    task_type     TINYINT      NOT NULL COMMENT '1=资格对账 2=库存对账 3=支付对账 4=订单对账',
     biz_no        VARCHAR(64)  DEFAULT NULL,
     activity_id   BIGINT       DEFAULT NULL,
     sku_id        BIGINT       DEFAULT NULL,

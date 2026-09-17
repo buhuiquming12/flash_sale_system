@@ -1,6 +1,7 @@
 package com.fss.seckill;
 
 import com.fss.biz.mq.ReliableMqProducer;
+import com.fss.biz.mq.StockRollbackFallback;
 import com.fss.biz.seckill.core.SeckillCompensateService;
 import com.fss.biz.seckill.core.SeckillExecutor;
 import com.fss.biz.seckill.core.SeckillTokenService;
@@ -61,7 +62,7 @@ class SeckillTokenGateTest {
                 mock(SeckillCompensateService.class), mock(UncertainRecorder.class),
                 mock(ReliableMqProducer.class), mock(OrderMapper.class),
                 mock(SeckillRequestMapper.class), degradeSwitch, mock(SeckillMetrics.class),
-                mock(AlarmService.class), props);
+                mock(AlarmService.class), props, mock(StockRollbackFallback.class));
     }
 
     private static SeckillCmd cmd(String token) {

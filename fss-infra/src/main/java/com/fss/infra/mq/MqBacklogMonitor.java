@@ -5,6 +5,8 @@ import com.fss.infra.metrics.SeckillMetrics;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.tools.admin.DefaultMQAdminExt;
+import org.apache.rocketmq.acl.common.AclClientRPCHook;
+import org.apache.rocketmq.acl.common.SessionCredentials;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
@@ -130,7 +132,9 @@ public class MqBacklogMonitor {
         }
         synchronized (this) {
             if (admin == null) {
-                DefaultMQAdminExt a = new DefaultMQAdminExt(5000);
+                DefaultMQAdminExt a = new DefaultMQAdminExt(new AclClientRPCHook(
+                        new SessionCredentials(props.getMq().getAccessKey(),
+                                props.getMq().getSecretKey())), 5000);
                 a.setNamesrvAddr(nameServer);
                 // 见类注释：必须与生产者/消费者的 instanceName 区分开
                 a.setInstanceName("fss-backlog-monitor");

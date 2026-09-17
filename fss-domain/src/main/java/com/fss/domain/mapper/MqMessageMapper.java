@@ -68,6 +68,24 @@ public interface MqMessageMapper extends BaseMapper<MqMessage> {
     List<MqMessage> selectExhausted(@Param("maxSendCount") int maxSendCount,
                                     @Param("limit") int limit);
 
+    /** 已发送超过观察窗口但仍未被消费端确认的记录。 */
+    @Select("""
+            SELECT * FROM t_mq_message
+             WHERE status = 1 AND update_time < #{before}
+             ORDER BY update_time, id
+             LIMIT #{limit}
+            """)
+    List<MqMessage> selectSentBefore(@Param("before") LocalDateTime before,
+                                     @Param("limit") int limit);
+
+    /** 终态记录按批清理，避免本地消息表无限增长。 */
+    @Update("""
+            DELETE FROM t_mq_message
+             WHERE status IN (2, 3) AND update_time < #{before}
+             ORDER BY id LIMIT #{limit}
+            """)
+    int deleteTerminalBefore(@Param("before") LocalDateTime before, @Param("limit") int limit);
+
     @Update("UPDATE t_mq_message SET status = 1 WHERE msg_id = #{msgId} AND status = 0")
     int markSent(@Param("msgId") String msgId);
 

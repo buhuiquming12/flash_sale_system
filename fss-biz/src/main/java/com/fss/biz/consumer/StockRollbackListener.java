@@ -1,11 +1,11 @@
 package com.fss.biz.consumer;
 
 import com.fss.biz.seckill.core.RollbackOutcome;
+import com.fss.biz.mq.MqConsumeRecorder;
 import com.fss.biz.seckill.core.SeckillCompensateService;
 import com.fss.common.error.ErrorCode;
 import com.fss.common.trace.TraceContext;
 import com.fss.common.util.JsonUtil;
-import com.fss.domain.mapper.MqMessageMapper;
 import com.fss.domain.message.OrderCreateMessage;
 import com.fss.domain.message.StockRollbackMessage;
 import com.fss.infra.mq.MqTopics;
@@ -32,10 +32,8 @@ import java.nio.charset.StandardCharsets;
  * <p>幂等靠脚本 B 的请求状态机（{@code status ~= 0 → return 1}），
  * 重复投递 10 次 {@code INCRBY} 只执行一次（故障用例 F11）。
  *
- * <p><b>重要：当前没有任何代码往这个 Topic 发消息。</b>
- * 补偿走的是同步直调 + 库存对账兜底（见 README「已知取舍」）。本消费者保留下来
- * 是为了让 F11 这条演练仍可执行——用 {@code mqadmin sendMessage} 手动重投即可。
- * 排查问题时不要去找生产端，它不存在。
+ * <p>正常补偿仍同步直调；只有同步回补返回 FAILED，生产端才登记该 Topic，
+ * 让 Redis 短暂故障可以跨进程重试。
  */
 @Slf4j
 @Component
@@ -50,7 +48,7 @@ import java.nio.charset.StandardCharsets;
 public class StockRollbackListener implements RocketMQListener<MessageExt> {
 
     private final SeckillCompensateService compensateService;
-    private final MqMessageMapper          mqMapper;
+    private final MqConsumeRecorder        consumeRecorder;
 
     @Override
     public void onMessage(MessageExt ext) {
@@ -66,6 +64,11 @@ public class StockRollbackListener implements RocketMQListener<MessageExt> {
 
         TraceContext.set(msg.getTraceId());
         try {
+            if (msg.getVersion() == null || msg.getVersion() > StockRollbackMessage.CURRENT_VERSION) {
+                log.error("stage=STOCK_ROLLBACK_MQ requestNo={} result=UNKNOWN_VERSION version={} 进死信",
+                        msg.getRequestNo(), msg.getVersion());
+                throw new IllegalStateException("未知消息版本: " + msg.getVersion());
+            }
             // 错误码从消息里带过来的 keepBought / failStatus 反推，
             // 而不是让消费端自己猜：判断"该不该还资格"的上下文只有生产者有
             ErrorCode ec = Boolean.TRUE.equals(msg.getKeepBought())
@@ -107,7 +110,7 @@ public class StockRollbackListener implements RocketMQListener<MessageExt> {
 
     private void markConsumed(MessageExt ext) {
         try {
-            mqMapper.markConsumedByBizKey(ext.getKeys(), MqTopics.STOCK_ROLLBACK);
+            consumeRecorder.consumed(ext.getKeys(), MqTopics.STOCK_ROLLBACK);
         } catch (Exception e) {
             log.debug("标记消息已消费失败 keys={}", ext.getKeys(), e);
         }

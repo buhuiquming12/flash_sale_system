@@ -3,6 +3,7 @@ package com.fss.biz.seckill.service.impl;
 import com.alibaba.csp.sentinel.annotation.SentinelResource;
 import com.alibaba.csp.sentinel.slots.block.BlockException;
 import com.fss.biz.mq.ReliableMqProducer;
+import com.fss.biz.mq.StockRollbackFallback;
 import com.fss.biz.seckill.core.RollbackOutcome;
 import com.fss.biz.seckill.core.SeckillCompensateService;
 import com.fss.biz.seckill.core.SeckillExecutor;
@@ -78,6 +79,7 @@ public class SeckillServiceImpl implements SeckillService {
     private final SeckillMetrics           metrics;
     private final AlarmService             alarm;
     private final FssProperties            props;
+    private final StockRollbackFallback    rollbackFallback;
 
     /**
      * {@code exceptionsToIgnore = BizException.class} 是这段集成里最关键的一行。
@@ -179,6 +181,8 @@ public class SeckillServiceImpl implements SeckillService {
             RollbackOutcome rollbackOutcome = compensateService.rollback(msg,
                     ErrorCode.SYSTEM_BUSY, "消息登记失败，已退回");
             if (rollbackOutcome.isFailed()) {
+                rollbackFallback.publish(msg, ErrorCode.SYSTEM_BUSY,
+                        "消息登记失败后的同步回补失败");
                 // 用户拿到的是"系统繁忙"，他会用新的 requestNo 重试；
                 // 而这一份库存没有任何后续机制会归还，只能靠对账
                 log.error("stage=SECKILL_SUBMIT requestNo={} result=ROLLBACK_FAILED 库存泄漏",

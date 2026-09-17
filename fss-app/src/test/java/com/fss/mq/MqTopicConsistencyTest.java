@@ -53,5 +53,11 @@ class MqTopicConsistencyTest {
         // 而没人知道"，正是死信处理器存在的全部意义
         assertThat(MqTopics.DLQ_ORDER_CREATE)
                 .isEqualTo("%DLQ%" + MqTopics.GID_ORDER_CREATE);
+        assertThat(MqTopics.DLQ_ORDER_CLOSE)
+                .isEqualTo("%DLQ%" + MqTopics.GID_ORDER_CLOSE);
+        assertThat(MqTopics.DLQ_STOCK_RELEASE)
+                .isEqualTo("%DLQ%" + MqTopics.GID_STOCK_RELEASE);
+        assertThat(MqTopics.DLQ_STOCK_ROLLBACK)
+                .isEqualTo("%DLQ%" + MqTopics.GID_STOCK_ROLLBACK);
     }
 }

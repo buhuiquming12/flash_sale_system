@@ -186,7 +186,7 @@ entity "**t_stock_log**\n库存流水" as slog #FFE0B2 {
 entity "**t_reconcile_task**\n对账任务" as rec #FFE0B2 {
   * id : bigint <<PK>>
   --
-  task_type : 1=资格 2=库存 3=支付
+  task_type : 1=资格 2=库存 3=支付 4=订单
   biz_no, activity_id, sku_id
   detail : text  JSON 差异明细
   status : 0=待处理 **1=自动修复成功**\n  **2=需人工** 3=人工已处理 4=忽略

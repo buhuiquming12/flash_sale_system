@@ -33,8 +33,10 @@
 # =====================================================================
 set -e
 
-NAMESRV="${NAMESRV:-rocketmq-namesrv:9876}"
+NAMESRV="${NAMESRV:-rocketmq-namesrv:9876;rocketmq-namesrv-b:9876}"
 CLUSTER="${CLUSTER:-DefaultCluster}"
+ACCESS_KEY="${ACCESS_KEY:-FssAdminAccessKey}"
+SECRET_KEY="${SECRET_KEY:-FssAdminSecretKeyChangeMeNow}"
 MQADMIN="${ROCKETMQ_HOME:-/home/rocketmq/rocketmq-5.3.0}/bin/mqadmin"
 
 # mqadmin 默认也要 4g 堆
@@ -47,7 +49,7 @@ WAIT_ROUNDS="${WAIT_ROUNDS:-60}"
 CREATE_ROUNDS="${CREATE_ROUNDS:-10}"
 
 topic_list() {
-    sh "$MQADMIN" topicList -n "$NAMESRV" 2>&1 || true
+    sh "$MQADMIN" topicList -n "$NAMESRV" -a "$ACCESS_KEY" -s "$SECRET_KEY" 2>&1 || true
 }
 
 # broker 向 namesrv 注册要几秒到几十秒。clusterList 的数据行以集群名开头，
@@ -55,9 +57,11 @@ topic_list() {
 wait_broker() {
     i=0
     while [ "$i" -lt "$WAIT_ROUNDS" ]; do
-        if sh "$MQADMIN" clusterList -n "$NAMESRV" 2>&1 \
-                | grep -qE "^${CLUSTER}[[:space:]]"; then
-            echo "==> broker 已注册到 $NAMESRV"
+        cluster=$(sh "$MQADMIN" clusterList -n "$NAMESRV" -a "$ACCESS_KEY" -s "$SECRET_KEY" 2>&1 || true)
+        a_count=$(echo "$cluster" | awk '$2 == "broker-a" {n++} END {print n+0}')
+        b_count=$(echo "$cluster" | awk '$2 == "broker-b" {n++} END {print n+0}')
+        if [ "$a_count" -ge 2 ] && [ "$b_count" -ge 2 ]; then
+            echo "==> broker-a/b 的 Master+Slave 已注册到双 namesrv"
             return 0
         fi
         i=$((i + 1))
@@ -71,7 +75,22 @@ wait_broker() {
 create() {
     echo "==> $1 (queues=$2)"
     # 退出码不可信，见文件头。失败与否一律靠后面的 verify 判定
-    sh "$MQADMIN" updateTopic -n "$NAMESRV" -c "$CLUSTER" -t "$1" -r "$2" -w "$2" || true
+    sh "$MQADMIN" updateTopic -n "$NAMESRV" -c "$CLUSTER" -t "$1" -r "$2" -w "$2" \
+        -a "$ACCESS_KEY" -s "$SECRET_KEY" || true
+}
+
+# timerWheelEnable=false 时定时消息会静默立即投递，必须在应用启动前失败。
+verify_timer_wheel() {
+    cluster=$(sh "$MQADMIN" clusterList -n "$NAMESRV" -a "$ACCESS_KEY" -s "$SECRET_KEY" 2>&1)
+    for broker in broker-a broker-b; do
+        addr=$(echo "$cluster" | awk -v b="$broker" '$2 == b && $3 == 0 {print $4; exit}')
+        if [ -z "$addr" ] || ! sh "$MQADMIN" getBrokerConfig -n "$NAMESRV" -b "$addr" \
+                -a "$ACCESS_KEY" -s "$SECRET_KEY" 2>&1 \
+                | grep -qE '^timerWheelEnable[[:space:]]*=[[:space:]]*true'; then
+            echo "[fatal] $broker timerWheelEnable 未开启，拒绝启动应用"
+            return 1
+        fi
+    done
 }
 
 # 回读校验。必须锚定整行：不锚的话 %RETRY%GID_FSS_ORDER_CREATE
@@ -92,6 +111,7 @@ verify() {
 }
 
 wait_broker
+verify_timer_wheel
 
 round=0
 while [ "$round" -lt "$CREATE_ROUNDS" ]; do

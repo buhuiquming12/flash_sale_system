@@ -143,7 +143,7 @@ group 可靠投递（决策 5：本地消息表）
     end note
     Ctrl --> C : **9001** 系统繁忙
   end
-  Prod -> MQ : syncSend
+  Prod -> MQ : asyncSend + callback
   alt send 失败
     MQ --> Prod : 超时/异常
     Prod -> Prod : **吞掉异常**，留给 MqResendJob

@@ -73,7 +73,7 @@ docker compose --profile all up -d --build
 ```
 
 一条命令按顺序拉起：MySQL（首次自动执行 `sql/V1__init.sql` 建表）→ Redis →
-RocketMQ namesrv + broker → **自动建好 4 个 Topic** → 应用容器
+RocketMQ 双 NameServer + 双 Broker（ACL）→ **自动建好 4 个 Topic** → 应用容器
 （`web,consumer,job,dev` 单进程）→ 前端容器 → Prometheus + Grafana。
 首次要构建应用与前端镜像（Maven 拉依赖 + `npm ci`），约 3~6 分钟；之后再起是秒级。
 
@@ -423,7 +423,7 @@ Lua 原子判扣 → 本地消息表 + 投递 → 立刻返回「排队中」
                               FSS_ORDER_CLOSE 定时消息（投递时刻 = expire_time）
 ```
 
-- **五个 Topic / 四个消费者**：`ORDER_CREATE` 异步落库、`ORDER_CLOSE` 定时关单、
+- **四个业务 Topic / 四条 DLQ 兜底链路**：`ORDER_CREATE` 异步落库、`ORDER_CLOSE` 定时关单、
   `STOCK_RELEASE` Redis 回补、`STOCK_ROLLBACK` 补偿回补、`%DLQ%GID_FSS_ORDER_CREATE`
   死信兜底。队列数 16/4/4/4，`autoCreateTopicEnable=false` 显式建
 - **本地消息表两个入口**：`sendReliable`（事务外，先落库再发）与
@@ -636,8 +636,11 @@ Redis 与 Lettuce / Redisson 的分工是刻意的：Lua 与普通读写走 Lett
   注意应用<b>必须在容器里</b>：哨兵通告的是容器名，宿主机上的进程解析不到。
   故障切换会丢未复制的写入，不是零丢失。生产也可上 Cluster；Key 已带 hash tag，
   上 Cluster 无需改代码。
-- **单 broker、消息数据不持久化到卷**。要持久化就得 `user: root`，
+- **双 NameServer + 两组 Master/Slave，但消息数据不持久化到卷**。broker-a/b 都以
+  `SYNC_MASTER` 加入同一集群、各配一个 Slave，并启用 ACL；演示环境仍不挂 store 卷。要持久化就得 `user: root`，
   为演示环境授这个权不值得。`stop`/`start` 数据保留，`down` 之后 Topic 需重建。
+  `docker/rocketmq/plain_acl.yml` 中是演示凭证，生产必须替换并通过
+  `FSS_MQ_ACCESS_KEY` / `FSS_MQ_SECRET_KEY` 注入应用。
 - **Nginx 只提供配置未接入本地运行**。它要 `proxy_pass` 到两个 web 容器，
   本地开发时应用跑在宿主机上，所以 compose 里放在 `phase5` profile 默认不启动。
 - **告警只到日志与指标，没有真实通道**。`P1` 是 `fss_alarm_total` 的一个标签，
@@ -657,11 +660,10 @@ Redis 与 Lettuce / Redisson 的分工是刻意的：Lua 与普通读写走 Lett
   少卖可以人工修，超卖要赔钱。差额留给库存对账发现。
 - **限购固定为 1**，所以资格对账回补时 `quantity` 写死 1。支持 >1 时必须从
   `t_seckill_request` 或消息体读真实数量，否则会回补错数量。
-- **补偿回补目前是直接调用而非发消息**。`FSS_STOCK_ROLLBACK` **只有消费者、没有生产者**：
-  重发放弃与死信兜底两条路径都是就地直接调 `compensateService.rollback` 的——
-  它已经在自己的线程里，多绕一次 MQ 只增加延迟。消费者与主题保留下来，
-  是为了让故障演练 F11（重投该主题验证脚本 B 幂等）仍可手动执行。
-  排查问题时不要去找它的生产端，它不存在。
+- **补偿回补采用“同步优先、失败转可靠消息”**。常态仍就地调用
+  `compensateService.rollback`，不为成功回补额外增加一次 MQ 跳转；只有返回
+  `FAILED` 时，才通过本地消息表登记并投递 `FSS_STOCK_ROLLBACK`。这样 Redis
+  短暂不可用时还有重发与死信兜底，重复投递则继续由脚本 B 的状态机保证幂等（F11）。
 - **Redis 令牌串错误时令牌也会被消费**。`GETDEL` 没有"比对不上就别删"这个选项，
   这是接受它的原子性所付的代价。key 由已认证的 userId 推出，攻击者只能作废自己的令牌。
 "# flash_sale_system" 

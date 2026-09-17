@@ -10,7 +10,8 @@ import com.fss.common.error.ErrorCode;
 import com.fss.common.trace.TraceContext;
 import com.fss.common.util.JsonUtil;
 import com.fss.domain.entity.Order;
-import com.fss.domain.mapper.MqMessageMapper;
+import com.fss.biz.mq.MqConsumeRecorder;
+import com.fss.biz.mq.StockRollbackFallback;
 import com.fss.domain.message.OrderCreateMessage;
 import com.fss.infra.alarm.AlarmService;
 import com.fss.infra.metrics.SeckillMetrics;
@@ -71,9 +72,10 @@ public class OrderCreateListener implements RocketMQListener<MessageExt> {
     private final OrderCreateService       orderCreateService;
     private final SeckillCompensateService compensateService;
     private final SeckillExecutor          executor;
-    private final MqMessageMapper          mqMapper;
+    private final MqConsumeRecorder        consumeRecorder;
     private final SeckillMetrics           metrics;
     private final AlarmService             alarm;
+    private final StockRollbackFallback    rollbackFallback;
 
     @Override
     public void onMessage(MessageExt ext) {
@@ -147,6 +149,7 @@ public class OrderCreateListener implements RocketMQListener<MessageExt> {
                         msg.getRequestNo(), ec.name());
                 RollbackOutcome outcome = compensateService.rollback(msg, ec, ec.getMessage());
                 if (outcome.isFailed()) {
+                    rollbackFallback.publish(msg, ec, ec.getMessage());
                     // 确定性失败本来就是为了"尽快把库存还回去"才就地回补的，
                     // 结果回补自己失败了 —— 这次没有 MQ 重试兜着（消息已经 ACK），
                     // 只能靠库存对账发现，所以按 P1 报出来
@@ -189,7 +192,7 @@ public class OrderCreateListener implements RocketMQListener<MessageExt> {
      */
     private void markConsumed(MessageExt ext) {
         try {
-            mqMapper.markConsumedByBizKey(ext.getKeys(), MqTopics.ORDER_CREATE);
+            consumeRecorder.consumed(ext.getKeys(), MqTopics.ORDER_CREATE);
         } catch (Exception e) {
             log.debug("标记消息已消费失败 keys={}", ext.getKeys(), e);
         }

@@ -8,7 +8,8 @@ public enum ReconcileTaskType implements CodeEnum {
 
     QUALIFICATION(1, "资格对账"),
     STOCK(2, "库存对账"),
-    PAYMENT(3, "支付对账");
+    PAYMENT(3, "支付对账"),
+    ORDER(4, "订单对账");
 
     private final int    code;
     private final String desc;

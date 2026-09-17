@@ -85,6 +85,7 @@ public class ReconcileRecorder {
             case QUALIFICATION -> "qualification";
             case STOCK         -> "stock";
             case PAYMENT       -> "payment";
+            case ORDER         -> "order";
         };
     }
 }

@@ -5,6 +5,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.client.producer.SendResult;
 import org.apache.rocketmq.client.producer.SendStatus;
+import org.apache.rocketmq.client.producer.SendCallback;
 import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.apache.rocketmq.spring.support.RocketMQHeaders;
 import org.springframework.messaging.Message;
@@ -60,6 +61,14 @@ public class MqSender {
             throw new IllegalStateException("发送状态异常: "
                     + (sr == null ? "null" : sr.getSendStatus()));
         }
+    }
+
+    /** 即时消息异步发送；回调异常由上层吞掉，绝不能逃逸到 MQ 回调线程。 */
+    public void sendAsync(String topic, String bizKey, String body, SendCallback callback) {
+        Message<String> m = MessageBuilder.withPayload(body)
+                .setHeader(RocketMQHeaders.KEYS, bizKey)
+                .build();
+        template.asyncSend(topic, m, callback, props.getMq().getSendTimeout());
     }
 
     private static long toMillis(LocalDateTime t) {

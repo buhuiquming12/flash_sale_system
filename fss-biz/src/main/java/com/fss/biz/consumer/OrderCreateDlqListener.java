@@ -2,6 +2,7 @@ package com.fss.biz.consumer;
 
 import com.fss.biz.seckill.core.RollbackOutcome;
 import com.fss.biz.seckill.core.SeckillCompensateService;
+import com.fss.biz.mq.StockRollbackFallback;
 import com.fss.common.enums.ReconcileTaskStatus;
 import com.fss.common.enums.ReconcileTaskType;
 import com.fss.common.error.ErrorCode;
@@ -48,7 +49,7 @@ import java.nio.charset.StandardCharsets;
 @RequiredArgsConstructor
 @RocketMQMessageListener(
         topic = MqTopics.DLQ_ORDER_CREATE,
-        consumerGroup = MqTopics.GID_DLQ_HANDLER,
+        consumerGroup = MqTopics.GID_DLQ_ORDER_CREATE_HANDLER,
         consumeMode = ConsumeMode.CONCURRENTLY,
         consumeThreadNumber = 2)
 public class OrderCreateDlqListener implements RocketMQListener<MessageExt> {
@@ -57,13 +58,22 @@ public class OrderCreateDlqListener implements RocketMQListener<MessageExt> {
     private final ReconcileTaskMapper      reconcileMapper;
     private final SeckillMetrics           metrics;
     private final AlarmService             alarm;
+    private final StockRollbackFallback    rollbackFallback;
 
     @Override
     public void onMessage(MessageExt ext) {
+        try {
+            handle(ext);
+        } catch (Exception e) {
+            // DLQ 处理器最后一道保险：任何观测/告警组件异常也不能触发死信重投。
+            log.error("stage=DLQ keys={} result=HANDLER_FAILED 已ACK转人工", ext.getKeys(), e);
+        }
+    }
+
+    private void handle(MessageExt ext) {
         String body = new String(ext.getBody(), StandardCharsets.UTF_8);
         log.error("stage=DLQ topic={} keys={} reconsume={} body={}",
                 ext.getTopic(), ext.getKeys(), ext.getReconsumeTimes(), body);
-        metrics.dlq(MqTopics.ORDER_CREATE);
 
         OrderCreateMessage msg = null;
         try {
@@ -73,6 +83,7 @@ public class OrderCreateDlqListener implements RocketMQListener<MessageExt> {
         }
 
         recordTask(ext, body, msg);
+        metrics.dlq(MqTopics.ORDER_CREATE);
         alarm.p2(AlarmService.Event.MQ_DLQ, ext.getKeys(), "订单创建消息进入死信队列");
 
         if (msg == null) {
@@ -86,6 +97,8 @@ public class OrderCreateDlqListener implements RocketMQListener<MessageExt> {
             RollbackOutcome outcome = compensateService.rollback(msg, ErrorCode.SYSTEM_BUSY,
                     "消息进入死信队列，已自动回补");
             if (outcome.isFailed()) {
+                rollbackFallback.publish(msg, ErrorCode.SYSTEM_BUSY,
+                        "订单创建死信同步回补失败");
                 // 死信里的回补也失败了：没有更后面的兜底了，只能靠库存对账，
                 // 所以按 P1 报出来，别混在正常的"已自动回补"里
                 log.error("stage=DLQ requestNo={} result=ROLLBACK_FAILED 库存泄漏", msg.getRequestNo());
